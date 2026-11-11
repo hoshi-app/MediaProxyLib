@@ -165,12 +165,11 @@ class CacheStore(
             }
             for (stream in targets) {
                 freed += streamBytesLocked(stream)
-                if (stream.refs == 0) {
-                    streams.remove(stream.key)
-                    stream.dir.deleteRecursively()
-                } else {
-                    stream.pendingDelete = true
-                }
+                // Записи чистим всегда: иначе после clear сервер отдавал бы «complete»-сегменты,
+                // файлов которых уже нет (FileBody падает, а плеер видит обрыв).
+                stream.entries.clear()
+                streams.remove(stream.key)
+                stream.dir.deleteRecursively()
             }
             return freed
         }
