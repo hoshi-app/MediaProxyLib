@@ -21,6 +21,10 @@ class FixtureOrigin {
 
     val segmentSize = 1000
     val segmentBytes: ByteArray = ByteArray(segmentSize) { (it * 7 % 251).toByte() }
+    val keyBytes: ByteArray = ByteArray(16) { (it + 1).toByte() }
+
+    /** Заголовки последнего запроса к /seg/1.ts — для проверки проброса сессии. */
+    val recordedHeaders = ConcurrentHashMap<String, String>()
 
     val port: Int get() = server.address.port
     val baseUrl: String get() = "http://127.0.0.1:$port"
@@ -29,6 +33,9 @@ class FixtureOrigin {
     val masterUrl: String get() = "$baseUrl/master.m3u8?tok=$token"
     val forbiddenUrl: String get() = "$baseUrl/forbidden.m3u8"
     val liveUrl: String get() = "$baseUrl/live.m3u8"
+    val plainUrl: String get() = "$baseUrl/plain"
+    val encryptedUrl: String get() = "$baseUrl/enc.m3u8"
+    val resumeUrl: String get() = "$baseUrl/resume.m3u8"
 
     fun start(): FixtureOrigin {
         server.executor = executor
@@ -48,7 +55,7 @@ class FixtureOrigin {
         counters.computeIfAbsent(key) { AtomicInteger(0) }.incrementAndGet()
     }
 
-    private fun mediaPlaylist(): String = buildString {
+    fun mediaPlaylist(): String = buildString {
         appendLine("#EXTM3U")
         appendLine("#EXT-X-TARGETDURATION:4")
         appendLine("#EXT-X-PLAYLIST-TYPE:VOD")
@@ -58,6 +65,21 @@ class FixtureOrigin {
         }
         appendLine("#EXT-X-ENDLIST")
     }
+
+    fun plainPlaylist(): String =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\ns-rel.ts\n#EXT-X-ENDLIST\n"
+
+    fun encryptedPlaylist(): String = buildString {
+        appendLine("#EXTM3U")
+        appendLine("#EXT-X-TARGETDURATION:4")
+        appendLine("#EXT-X-KEY:METHOD=AES-128,URI=\"key\",IV=0x00000000000000000000000000000001")
+        appendLine("#EXTINF:4.0,")
+        appendLine("$baseUrl/seg/2.ts?tok=$token")
+        appendLine("#EXT-X-ENDLIST")
+    }
+
+    fun resumePlaylist(): String =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\n$baseUrl/resume-flaky\n#EXT-X-ENDLIST\n"
 
     private fun masterPlaylist(): String = buildString {
         appendLine("#EXTM3U")
@@ -122,8 +144,40 @@ class FixtureOrigin {
                 bump("html")
                 send(exchange, 200, "text/html", "<html>error</html>".toByteArray(), null)
             }
+            path == "/plain" -> {
+                bump("plain")
+                send(exchange, 200, "text/plain", plainPlaylist().toByteArray(), range)
+            }
+            path == "/enc.m3u8" -> {
+                bump("enc")
+                send(exchange, 200, "application/vnd.apple.mpegurl", encryptedPlaylist().toByteArray(), range)
+            }
+            path == "/key" -> {
+                bump("key")
+                send(exchange, 200, "application/octet-stream", keyBytes, null)
+            }
+            path == "/resume.m3u8" -> {
+                bump("resume-playlist")
+                send(exchange, 200, "application/vnd.apple.mpegurl", resumePlaylist().toByteArray(), range)
+            }
+            path == "/resume-flaky" -> {
+                val n = counters.computeIfAbsent("resume-flaky") { AtomicInteger(0) }.incrementAndGet()
+                if (n == 1 && range == null) {
+                    exchange.sendResponseHeaders(200, segmentSize.toLong())
+                    exchange.responseBody.write(segmentBytes, 0, 400)
+                    exchange.responseBody.flush()
+                    exchange.close()
+                } else {
+                    send(exchange, 200, "video/mp2t", segmentBytes, range)
+                }
+            }
             path.startsWith("/seg/") -> {
                 val index = path.removePrefix("/seg/").substringBefore('.')
+                if (index == "1") {
+                    recordedHeaders["accept-encoding"] = exchange.requestHeaders.getFirst("Accept-Encoding") ?: ""
+                    recordedHeaders["user-agent"] = exchange.requestHeaders.getFirst("User-Agent") ?: ""
+                    recordedHeaders["origin"] = exchange.requestHeaders.getFirst("Origin") ?: ""
+                }
                 bump("seg-$index")
                 send(exchange, 200, "video/mp2t", segmentBytes, range)
             }

@@ -48,6 +48,9 @@ fun main() {
     testHttpServer()
     testOriginClient()
     testEngine()
+    testEnginePlaylistExtras()
+    testEngineResumeAndKey()
+    testEngineLifecycle()
     println()
     println(if (failures == 0) "OK: $checks проверок" else "ПРОВАЛ: $failures из $checks")
     exitProcess(if (failures > 0) 1 else 0)
@@ -769,6 +772,181 @@ private fun testEngine() {
     }
 }
 
+private fun firstSegment(text: String): String =
+    uriLines(text).firstOrNull { it.startsWith("http://127.0.0.1:") } ?: ""
+
+private fun testConfig(extra: Map<String, Any?> = emptyMap()): Map<String, Any?> = mapOf(
+    "maxCacheMB" to 8,
+    "minFreeDiskMB" to 0,
+    "prewarmSegments" to 0,
+    "prefetchMaxSegments" to 0,
+    "reqFirstByteSec" to 2,
+    "reqSilenceSec" to 2,
+    "prefetchRetries" to 1,
+    "retryBackoffMs" to listOf(0L),
+    "cooldownSec" to 60,
+    "allowLoopbackOrigins" to true,
+    "maxLoopbackConnections" to 16,
+) + extra
+
+private fun newEngine(dir: File, extra: Map<String, Any?> = emptyMap()): ProxyEngine {
+    val engine = ProxyEngine(File(dir, "engine"))
+    engine.setConfig(testConfig(extra))
+    engine.start()
+    return engine
+}
+
+private fun testEnginePlaylistExtras() {
+    group("ProxyEngine: плейлисты/заголовки")
+    val origin = FixtureOrigin().start()
+    val dir = tempDir()
+    val engine = newEngine(dir)
+    try {
+        val headers = mapOf("User-Agent" to "ProxyTest/1.0")
+        val plain = engine.resolve(origin.plainUrl, ProxyEngine.ResolveOptions("plain|1", headers, prewarm = false))
+        truth("plain resolve", plain.cached)
+        val playlist = httpGet(plain.url)
+        eq("plain status", 200, playlist.status)
+        eq("plain content-type", "application/vnd.apple.mpegurl", playlist.headers["content-type"])
+        val segments = uriLines(String(playlist.body))
+        eq("plain один сегмент", 1, segments.size)
+        truth("plain сегмент .ts", segments.firstOrNull()?.endsWith(".ts") == true)
+
+        val ranged = httpGet(plain.url, mapOf("Range" to "bytes=0-1"))
+        eq("range на плейлисте status", 206, ranged.status)
+        eq("range на плейлисте body", 2, ranged.body.size)
+        eq("range на плейлисте header", "bytes 0-1/${playlist.body.size}", ranged.headers["content-range"])
+
+        val head = httpGet(plain.url, method = "HEAD")
+        eq("HEAD плейлиста status", 200, head.status)
+        eq("HEAD плейлиста length", playlist.body.size.toString(), head.headers["content-length"])
+        eq("HEAD плейлиста body", 0, head.body.size)
+
+        val media = engine.resolve(origin.mediaUrl, ProxyEngine.ResolveOptions("media|1", headers, prewarm = false))
+        val mediaPlaylist = httpGet(media.url)
+        eq("media playlist", 200, mediaPlaylist.status)
+        val second = uriLines(String(mediaPlaylist.body)).getOrNull(1) ?: ""
+        truth("второй сегмент loopback", second.startsWith("http://127.0.0.1:"))
+        val segment = httpGet(second)
+        eq("segment 1", 200, segment.status)
+        eq("UA доехал до сегмента", "ProxyTest/1.0", origin.recordedHeaders["user-agent"])
+        eq("Accept-Encoding identity", "identity", origin.recordedHeaders["accept-encoding"])
+        eq("Origin не добавлен", "", origin.recordedHeaders["origin"])
+    } finally {
+        engine.stop()
+        origin.stop()
+        cleanup(dir)
+    }
+}
+
+private fun testEngineResumeAndKey() {
+    group("ProxyEngine: докачка и AES-ключ")
+    val origin = FixtureOrigin().start()
+    val dir = tempDir()
+    val engine = newEngine(dir)
+    try {
+        val headers = mapOf("User-Agent" to "ProxyTest/1.0")
+        val resume = engine.resolve(origin.resumeUrl, ProxyEngine.ResolveOptions("resume|1", headers, prewarm = false))
+        val resumePlaylist = httpGet(resume.url)
+        eq("resume playlist", 200, resumePlaylist.status)
+        val resumeSegment = firstSegment(String(resumePlaylist.body))
+        truth("resume сегмент loopback", resumeSegment.startsWith("http://127.0.0.1:"))
+        val resumed = httpGet(resumeSegment)
+        eq("resume status", 200, resumed.status)
+        truth("resume байты", resumed.body.contentEquals(origin.segmentBytes))
+        truth("resume был повтор", origin.hits("resume-flaky") >= 2)
+
+        val bytesBefore = engine.stats()["bytes"] as Long
+        val encrypted = engine.resolve(origin.encryptedUrl, ProxyEngine.ResolveOptions("enc|1", headers, prewarm = false))
+        val encPlaylist = httpGet(encrypted.url)
+        eq("enc playlist", 200, encPlaylist.status)
+        val keyUrl = Regex("URI=\"([^\"]+)\"").find(String(encPlaylist.body))?.groupValues?.get(1) ?: ""
+        truth("key URL loopback", keyUrl.startsWith("http://127.0.0.1:"))
+        truth("key URL .key", keyUrl.endsWith(".key"))
+        val key = httpGet(keyUrl)
+        eq("key status", 200, key.status)
+        truth("key байты", key.body.contentEquals(origin.keyBytes))
+        eq("ключ не попал на диск", bytesBefore, engine.stats()["bytes"] as Long)
+    } finally {
+        engine.stop()
+        origin.stop()
+        cleanup(dir)
+    }
+}
+
+private fun testEngineLifecycle() {
+    group("ProxyEngine: жизненный цикл")
+    val origin = FixtureOrigin().start()
+    val dir = tempDir()
+    val engine = newEngine(dir, mapOf("maxSessions" to 1))
+    val zeroDir = tempDir()
+    var zero: ProxyEngine? = null
+    try {
+        val headers = mapOf("User-Agent" to "ProxyTest/1.0")
+        val a = engine.resolve(origin.plainUrl, ProxyEngine.ResolveOptions("a|1", headers, prewarm = false))
+        val b = engine.resolve(origin.encryptedUrl, ProxyEngine.ResolveOptions("b|1", headers, prewarm = false))
+        eq("старая сессия вытеснена", 410, httpGet(a.url).status)
+        eq("новая сессия жива", 200, httpGet(b.url).status)
+        engine.release(b.streamId)
+        eq("release -> 410", 410, httpGet(b.url).status)
+
+        val c = engine.resolve(origin.plainUrl, ProxyEngine.ResolveOptions("c|1", headers, prewarm = false))
+        val failed = engine.failOpen(c.url)
+        eq("failOpen по URL вернул origin", origin.plainUrl, failed?.get("originUrl"))
+        eq("failOpen -> 410", 410, httpGet(c.url).status)
+
+        zero = newEngine(zeroDir, mapOf("maxCacheMB" to 0))
+        val zeroResolved = zero.resolve(origin.mediaUrl, ProxyEngine.ResolveOptions("zero|1", headers, prewarm = false))
+        val zeroPlaylist = httpGet(zeroResolved.url)
+        eq("pass-through playlist", 200, zeroPlaylist.status)
+        val zeroSegment = firstSegment(String(zeroPlaylist.body))
+        eq("pass-through segment", 200, httpGet(zeroSegment).status)
+        eq("при maxCacheMB=0 ничего не кэшируется", 0L, zero.stats()["bytes"] as Long)
+
+        val cached = engine.resolve(origin.mediaUrl, ProxyEngine.ResolveOptions("clear|1", headers, prewarm = false))
+        val cachedPlaylist = httpGet(cached.url)
+        val cachedSegment = firstSegment(String(cachedPlaylist.body))
+        eq("сегмент до clear", 200, httpGet(cachedSegment).status)
+        waitUntil(3000) {
+            @Suppress("UNCHECKED_CAST")
+            val segments = engine.streamState(cached.streamId)["segments"] as List<Map<String, Any?>>
+            segments.firstOrNull()?.get("complete") == true
+        }
+        val hitsBefore = origin.hits("seg-0")
+        val cleared = engine.clearCache(cached.streamId)
+        truth("clearCache освободил байты", (cleared["freedBytes"] as Long) > 0)
+        val afterClear = httpGet(cachedSegment)
+        eq("сегмент после clear", 200, afterClear.status)
+        truth("после clear перекачали", origin.hits("seg-0") > hitsBefore)
+
+        engine.stop()
+        val restarted = engine.start()
+        truth("restart running", restarted.running)
+        val restartMedia = engine.resolve(origin.mediaUrl, ProxyEngine.ResolveOptions("restart|1", headers, prewarm = false))
+        val restartPlaylist = httpGet(restartMedia.url)
+        eq("restart playlist", 200, restartPlaylist.status)
+        val restartSegment = firstSegment(String(restartPlaylist.body))
+        val restartResult = httpGet(restartSegment)
+        eq("restart segment", 200, restartResult.status)
+        truth("restart байты", restartResult.body.contentEquals(origin.segmentBytes))
+
+        // мусорный запрос не валит сервер
+        Socket("127.0.0.1", engine.port).use { socket ->
+            socket.soTimeout = 2000
+            socket.getOutputStream().write("GARBAGE\r\n\r\n".toByteArray())
+            socket.getOutputStream().flush()
+            runCatching { socket.getInputStream().readBytes() }
+        }
+        eq("сервер жив после мусора", 200, httpGet(restartMedia.url).status)
+    } finally {
+        zero?.stop()
+        engine.stop()
+        origin.stop()
+        cleanup(dir)
+        cleanup(zeroDir)
+    }
+}
+
 private fun waitUntil(timeoutMs: Long, condition: () -> Boolean): Boolean {
     val deadline = System.currentTimeMillis() + timeoutMs
     while (System.currentTimeMillis() < deadline) {
@@ -782,14 +960,15 @@ private fun waitUntil(timeoutMs: Long, condition: () -> Boolean): Boolean {
 
 private data class HttpResult(val status: Int, val body: ByteArray, val headers: Map<String, String>)
 
-private fun httpGet(url: String, headers: Map<String, String> = emptyMap()): HttpResult {
+private fun httpGet(url: String, headers: Map<String, String> = emptyMap(), method: String = "GET"): HttpResult {
     val connection = URL(url).openConnection() as HttpURLConnection
+    connection.requestMethod = method
     connection.connectTimeout = 5000
     connection.readTimeout = 15000
     connection.instanceFollowRedirects = false
     headers.forEach { (key, value) -> connection.setRequestProperty(key, value) }
     val status = connection.responseCode
-    val stream = if (status < 400) connection.inputStream else connection.errorStream
+    val stream = if (method == "HEAD") null else if (status < 400) connection.inputStream else connection.errorStream
     val body = stream?.use { it.readBytes() } ?: ByteArray(0)
     val responseHeaders = LinkedHashMap<String, String>()
     connection.headerFields.forEach { (key, values) ->
