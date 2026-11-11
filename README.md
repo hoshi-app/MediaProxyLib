@@ -29,9 +29,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-core.ps1
 ## Быстрый контракт
 
 ```ts
-const { url, cached } = MediaProxy.resolve(origin, {
-  cacheKey: 't28825|p-cvh|e2|q720',
-  headers: { 'User-Agent': '...' },
+import * as MediaProxy from 'react-native-media-proxy';
+
+await MediaProxy.start();                       // один раз на процесс
+MediaProxy.setConfig({ maxCacheMB: 512 });      // политика — из JS
+
+const source = MediaProxy.resolve(origin, {
+  cacheKey: 't28825|p-cvh|e2|q720',             // стабильная идентичность кэша
+  headers: { 'User-Agent': '...' },             // уйдут на master/вариант/сегменты
 });
-// url = http://127.0.0.1:<port>/s/<sid>/<b64>/<name>.m3u8
+// source.url = http://127.0.0.1:<port>/s/<sid>/<b64>/<name>.m3u8
+// source.cached === false → играем origin (fail-open), ничего не сломано
+
+const off = MediaProxy.onAuthRequired((e) => {
+  // 400/401/403/410: перерезолвить поток и перемонтировать плеер
+});
 ```
+
+Методы: `start`, `resolve`, `release`, `failOpen`, `nudge`, `setConfig`, `getStats`,
+`getStreamState`, `clearCache`; события: `onError`, `onAuthRequired`, `onServerState`, `onCache`.
+Плейлисты, Range, prefetch, лимит кэша и вытеснение — нативно; JS только задаёт политику и
+разбирает ошибки.
+
