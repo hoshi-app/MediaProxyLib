@@ -10,21 +10,35 @@
 | Часть | Состояние |
 |---|---|
 | План | утверждён, `docs/PLAN.md` |
-| Swift-ядро (`ios/`) | пишется, на этой машине не собирается (нужен macOS) |
-| Kotlin-ядро (`android/`) | пишется и собирается локально (JDK 17 + Android SDK, офлайн) |
-| TS-оболочка (`src/`, `app.plugin.js`) | пишется, typecheck локально |
+| Протокол | `docs/PROTOCOL.md` — общий контракт Swift/Kotlin/TS |
+| Swift-ядро (`ios/`) | написано, на этой машине не собиралось (нужен macOS) |
+| Kotlin-ядро (`android/`) | собирается и проверено локально: **253 проверки зелёные** |
+| TS-оболочка (`src/`, `app.plugin.js`) | typecheck зелёный |
+| Android-библиотека (AGP/Expo) | не собиралась: нужен host-проект Expo и Maven |
 
-## Сборка Android без сети
+## Сборка и проверка без сети
 
-Maven в этой среде недоступен, поэтому проверка ядра идёт кэшированным Kotlin-компилятором:
+Maven в этой среде недоступен, поэтому ядро и тесты идут кэшированным Kotlin-компилятором:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-core.ps1
 ```
 
-Скрипт компилирует `android/src/main/java/tv/mediaproxy/core` и тесты, затем запускает
-`tv.mediaproxy.SelfTestKt` (assert-раннер, exit code 1 при провале). Для сборки внутри Expo-приложения
-используется обычный Gradle-модуль `android/`.
+Скрипт компилирует `android/src/main/java/tv/mediaproxy/core`, затем тесты и запускает
+`tv.mediaproxy.core.SelfTestKt` (assert-раннер, exit code 1 при провале). Покрыто: Range/206/416,
+перезапись HLS (master/media, MAP/KEY/MEDIA, AES-128, BYTERANGE, live, LL-HLS), журнал и реконсиляция
+кэша, эвикция, HTTP-сервер (keep-alive, HEAD, потоки, 8 параллельных), origin-клиент (206-докачка,
+HTML, 403/5xx, обрыв, тишина, пол скорости), сквозной прокси (заголовки, кэш-хит, перерезолв с новым
+токеном, префетч, clearCache, restart, fail-open, авторизация, cooldown).
+
+TypeScript:
+
+```powershell
+node C:\dev\AnimeApp\app\node_modules\typescript\bin\tsc -p tsconfig.json
+```
+
+Внутри Expo-приложения используется обычный Gradle-модуль `android/` (AGP + expo-module-gradle-plugin);
+эта сборка требует host-проект и доступ к Maven, поэтому здесь не запускалась.
 
 ## Быстрый контракт
 
