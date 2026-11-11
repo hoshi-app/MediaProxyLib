@@ -78,16 +78,19 @@ public final class ProxyEngine {
         let stream: CacheStore.Stream
         let segment: PlaylistSegment?
         let feed: ByteFeed
+        let isPrefetch: Bool
         var attempts = 0
         var cancelled = false
         var lastError: ProxyErrorCode?
 
-        init(key: String, session: Session, stream: CacheStore.Stream, segment: PlaylistSegment?, feed: ByteFeed) {
+        init(key: String, session: Session, stream: CacheStore.Stream, segment: PlaylistSegment?,
+             feed: ByteFeed, isPrefetch: Bool) {
             self.key = key
             self.session = session
             self.stream = stream
             self.segment = segment
             self.feed = feed
+            self.isPrefetch = isPrefetch
         }
     }
 
@@ -221,7 +224,7 @@ public final class ProxyEngine {
                               generation: generation, now: now)
         sessionsLock.lock()
         sessions[sid] = session
-        evictOldSessionsLocked(now: now)
+        evictOldSessionsLocked(now: now, keeping: sid)
         sessionsLock.unlock()
 
         let kind: ResourceKind = PlaylistRewriter.isPlaylistCandidate(url: originUrl, contentType: nil) ? .playlist : .playlist
@@ -460,10 +463,12 @@ public final class ProxyEngine {
             return nil
         }
         let feed = ByteFeed(file: cache.fileURL(stream, index))
-        let download = Download(key: key, session: session, stream: stream, segment: segment, feed: feed)
+        let download = Download(key: key, session: session, stream: stream, segment: segment,
+                                feed: feed, isPrefetch: false)
         downloads[key] = download
         downloadsLock.unlock()
         cache.retain(stream)
+        cache.ensureEntry(stream, index: index, now: Date().timeIntervalSince1970)
         cache.update(stream, index: index) { entry in
             entry.downloading = true
             entry.total = -1
@@ -505,6 +510,7 @@ public final class ProxyEngine {
             if terminal == nil {
                 let total = download.feed.total
                 let written = download.feed.written
+                cache.ensureEntry(download.stream, index: download.segment?.index ?? 0, now: Date().timeIntervalSince1970)
                 cache.update(download.stream, index: download.segment?.index ?? 0) { e in
                     e.total = total
                     e.prefix = written
@@ -522,6 +528,7 @@ public final class ProxyEngine {
                 // origin проигнорировал Range: начинаем сегмент заново.
                 let fresh = ByteFeed(file: cache.fileURL(download.stream, download.segment?.index ?? 0))
                 // проще: пометить failed и позволить плееру перезапросить
+                cache.ensureEntry(download.stream, index: download.segment?.index ?? 0, now: Date().timeIntervalSince1970)
                 cache.update(download.stream, index: download.segment?.index ?? 0) { e in
                     e.prefix = 0; e.total = -1; e.downloading = false; e.failedUntil = 0
                 }
@@ -540,6 +547,8 @@ public final class ProxyEngine {
 
             let written = download.feed.written
             let total = download.feed.total
+            download.feed.fail(code)
+            cache.ensureEntry(download.stream, index: download.segment?.index ?? 0, now: Date().timeIntervalSince1970)
             cache.update(download.stream, index: download.segment?.index ?? 0) { e in
                 e.total = total
                 e.prefix = written
@@ -561,9 +570,9 @@ public final class ProxyEngine {
         downloads.removeValue(forKey: download.key)
         downloadsLock.unlock()
         cache.release(download.stream)
-        if error == nil, let segment = download.segment {
-            let next = segment.index + 1
-            prefetched.insert("\(download.stream.cacheKey)|\(next)")
+        // Метка о следующем сегменте здесь НЕ ставится: иначе prefetch «считает» сегмент готовым,
+        // ни разу его не скачав. Учёт — только по завершённой собственной загрузке prefetch.
+        if error == nil && download.isPrefetch {
             bumpPrefetched()
         }
     }
@@ -610,7 +619,8 @@ public final class ProxyEngine {
             return false
         }
         let feed = ByteFeed(file: cache.fileURL(stream, segment.index))
-        let download = Download(key: key, session: session, stream: stream, segment: segment, feed: feed)
+        let download = Download(key: key, session: session, stream: stream, segment: segment,
+                                feed: feed, isPrefetch: true)
         downloads[key] = download
         prefetched.insert("\(session.cacheKey)|\(segment.index)")
         downloadsLock.unlock()
@@ -618,6 +628,8 @@ public final class ProxyEngine {
         prefetchQueue.addOperation { [weak self] in
             guard let self else { return }
             self.cache.retain(stream)
+            // У prefetch нет «запроса плеера», который создал бы запись: без ensureEntry update молчит.
+            self.cache.ensureEntry(stream, index: segment.index, now: Date().timeIntervalSince1970)
             self.cache.update(stream, index: segment.index) { entry in
                 entry.downloading = true
                 entry.total = -1
@@ -713,11 +725,13 @@ public final class ProxyEngine {
         return parts.count >= 2 ? String(parts[1]) : nil
     }
 
-    private func evictOldSessionsLocked(now: TimeInterval) {
+    private func evictOldSessionsLocked(now: TimeInterval, keeping: String) {
         let maxSessions = config.maxSessions
         while sessions.count > maxSessions {
-            guard let oldest = sessions.values.min(by: { $0.lastAccess < $1.lastAccess }) else { break }
-            sessions.removeValue(forKey: oldest.id)
+            // Вытесняем только ДРУГИЕ сессии: при равных timestamp могли выбросить новую.
+            guard let victim = sessions.values.filter({ $0.id != keeping })
+                .min(by: { $0.lastAccess < $1.lastAccess }) else { break }
+            sessions.removeValue(forKey: victim.id)
         }
     }
 

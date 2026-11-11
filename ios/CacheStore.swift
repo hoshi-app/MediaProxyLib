@@ -183,12 +183,11 @@ public final class CacheStore {
         }
         for s in targets {
             freed += streamBytesLocked(s)
-            if s.refs == 0 {
-                streams.removeValue(forKey: s.key)
-                Fs.removeIfExists(s.dir)
-            } else {
-                s.pendingDelete = true
-            }
+            // Записи чистим всегда: иначе после clear сервер отдавал бы «complete»-сегменты,
+            // файлов которых уже нет (FileBody падает, а плеер видит обрыв).
+            s.entries.removeAll()
+            streams.removeValue(forKey: s.key)
+            Fs.removeIfExists(s.dir)
         }
         return freed
     }
@@ -198,27 +197,31 @@ public final class CacheStore {
     private func load(_ stream: Stream) {
         let journalURL = stream.dir.appendingPathComponent("journal.log")
         let lines = Fs.readLines(journalURL)
-        var headerOK = false
+        // Append-only журнал: последняя запись по индексу побеждает, сверка с файлом — один раз на запись.
+        var latest: [Int: Entry] = [:]
         for line in lines {
             let parts = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-            if parts.first == "H", parts.count >= 4 {
-                headerOK = parts[3] == stream.fingerprint
-            } else if parts.first == "S", parts.count >= 8 {
-                guard let index = Int(parts[1]), let total = Int64(parts[2]),
-                      let prefix = Int64(parts[3]) else { continue }
-                let complete = parts[4] == "1"
-                let contentType = parts[5]
-                let lastAccess = Double(parts[6]) ?? 0
-                var e = Entry(index: index, total: total, prefix: prefix, complete: complete,
-                              contentType: contentType, file: fileURL(stream, index), lastAccess: lastAccess)
-                let size = Fs.size(e.file)
-                if size == 0 && !complete { continue }
-                if e.prefix > size { e.prefix = size }
-                if size > e.prefix { Fs.truncate(e.file, to: e.prefix) }
-                if e.total >= 0 && e.prefix < e.total { e.complete = false }
-                if e.complete && e.total < 0 { e.complete = false }
-                if e.prefix > 0 || e.complete { stream.entries[index] = e }
-            }
+            guard parts.first == "S", parts.count >= 8,
+                  let index = Int(parts[1]), let total = Int64(parts[2]),
+                  let prefix = Int64(parts[3]) else { continue }
+            latest[index] = Entry(
+                index: index,
+                total: total,
+                prefix: prefix,
+                complete: parts[4] == "1",
+                contentType: parts[5].isEmpty ? nil : parts[5],
+                file: fileURL(stream, index),
+                lastAccess: Double(parts[6]) ?? 0)
+        }
+        for (index, stored) in latest {
+            var e = stored
+            let size = Fs.size(e.file)
+            if size == 0 && !e.complete { continue }
+            if e.prefix > size { e.prefix = size }
+            if size > e.prefix { Fs.truncate(e.file, to: e.prefix) }
+            if e.total >= 0 && e.prefix < e.total { e.complete = false }
+            if e.total < 0 { e.complete = false }
+            if e.prefix > 0 || e.complete { stream.entries[index] = e }
         }
         // Файлы, которых нет в журнале, — сироты.
         let known = Set(stream.entries.keys.map { String(format: "s%05d.bin", $0) })
@@ -228,9 +231,6 @@ public final class CacheStore {
             }
         }
         rewriteJournal(stream)
-        if !headerOK {
-            // после rewriteJournal шапка уже актуальна
-        }
     }
 
     private func rewriteJournal(_ stream: Stream) {

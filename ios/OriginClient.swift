@@ -206,7 +206,9 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         guard !call.finished else { return }
         let written = call.feed.written
         if let error {
-            let code = OriginClient.map(error)
+            var code = OriginClient.map(error)
+            // Обрыв после первых байт — недокачанный ответ: движок ретраит с префикса.
+            if written > 0 && code == .connectFailed { code = .truncated }
             finish(call, error: code)
             return
         }

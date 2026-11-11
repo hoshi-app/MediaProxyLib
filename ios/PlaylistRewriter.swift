@@ -115,13 +115,23 @@ public enum PlaylistRewriter {
                     }
                 }
 
-                // URI-несущие теги: переписываем сам атрибут.
+                // URI-несущие теги: переписываем сам атрибут (резолв от финального URL обязателен).
                 if let kind = uriTagKind(upper) {
-                    let lineOut = rewriteUriAttribute(line, kind: kind) { absolute, k in
-                        if k == .playlist { return proxy(absolute, .playlist) }
-                        if k == .key { media.keyUrls.append(absolute); return proxy(absolute, .key) }
-                        if upper.hasPrefix("#EXT-X-MAP") { media.initUrl = absolute }
-                        return proxy(absolute, .segment)
+                    let lineOut = rewriteUriAttribute(line) { raw in
+                        let absolute = UrlResolver.resolve(base: finalUrl, reference: raw)
+                        if !absolute.hasPrefix("http://") && !absolute.hasPrefix("https://") {
+                            return nil  // skd:// и прочие не-HTTP схемы обрабатывает плеер
+                        }
+                        switch kind {
+                        case .playlist:
+                            return proxy(absolute, .playlist)
+                        case .key:
+                            media.keyUrls.append(absolute)
+                            return proxy(absolute, .key)
+                        case .segment:
+                            if upper.hasPrefix("#EXT-X-MAP") { media.initUrl = absolute }
+                            return proxy(absolute, .segment)
+                        }
                     }
                     out.append(lineOut)
                 } else {
@@ -173,25 +183,22 @@ public enum PlaylistRewriter {
     // MARK: - private
 
     private static func uriTagKind(_ upper: String) -> ResourceKind? {
-        if upper.hasPrefix("#EXT-X-MEDIA:") || upper.hasPrefix("#EXT-X-MEDIA:") { return .playlist }
-        if upper.hasPrefix("#EXT-X-I-FRAME-STREAM-INF") { return .playlist }
+        if upper.hasPrefix("#EXT-X-MEDIA:") || upper.hasPrefix("#EXT-X-I-FRAME-STREAM-INF") { return .playlist }
         if upper.hasPrefix("#EXT-X-KEY") || upper.hasPrefix("#EXT-X-SESSION-KEY") { return .key }
         if upper.hasPrefix("#EXT-X-MAP") { return .segment }
         if upper.hasPrefix("#EXT-X-PART") || upper.hasPrefix("#EXT-X-PRELOAD-HINT") { return .segment }
         return nil
     }
 
-    private static func rewriteUriAttribute(_ line: String, kind: ResourceKind,
-                                            resolve: (String, ResourceKind) -> String) -> String {
+    private static func rewriteUriAttribute(_ line: String, resolve: (String) -> String?) -> String {
         guard let match = uriAttribute.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) else {
             return line
         }
         let ns = line as NSString
         let raw = ns.substring(with: match.range(at: 1))
-        // METHOD=NONE / пустой URI — не трогаем
         if raw.isEmpty { return line }
-        let replaced = resolve(raw, kind)
-        return ns.replacingCharacters(in: match.range(at: 1), with: replaced)
+        guard let replacement = resolve(raw) else { return line }
+        return ns.replacingCharacters(in: match.range, with: "URI=\"\(replacement)\"")
     }
 
     private static func attribute(_ name: String, _ line: String) -> String? {
@@ -239,6 +246,8 @@ public enum UrlResolver {
         guard let resolved = URL(string: ref, relativeTo: baseURL)?.absoluteString else { return ref }
 
         let refHasQuery = ref.contains("?")
+        // Схемо-относительная ссылка — самостоятельный URL: query базы не наследуем.
+        if ref.hasPrefix("//") { return resolved }
         let baseQuery = baseURL.query
         if !refHasQuery, let q = baseQuery, !q.isEmpty, !resolved.contains("?") {
             return resolved + "?" + q
