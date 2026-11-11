@@ -570,7 +570,6 @@ class ProxyEngine(private val root: File) {
         } finally {
             synchronized(downloadsLock) {
                 downloads.remove(download.key)
-                if (download.isPrefetch) prefetchedCount.incrementAndGet()
             }
             cache.release(download.stream)
         }

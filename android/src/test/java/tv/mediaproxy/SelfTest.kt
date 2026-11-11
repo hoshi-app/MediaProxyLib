@@ -51,6 +51,7 @@ fun main() {
     testEnginePlaylistExtras()
     testEngineResumeAndKey()
     testEngineLifecycle()
+    testEnginePrefetchState()
     println()
     println(if (failures == 0) "OK: $checks проверок" else "ПРОВАЛ: $failures из $checks")
     exitProcess(if (failures > 0) 1 else 0)
@@ -855,6 +856,11 @@ private fun testEngineResumeAndKey() {
         eq("resume status", 200, resumed.status)
         truth("resume байты", resumed.body.contentEquals(origin.segmentBytes))
         truth("resume был повтор", origin.hits("resume-flaky") >= 2)
+        waitUntil(3000) {
+            @Suppress("UNCHECKED_CAST")
+            val segments = engine.streamState(resume.streamId)["segments"] as List<Map<String, Any?>>
+            segments.firstOrNull()?.get("complete") == true
+        }
 
         val bytesBefore = engine.stats()["bytes"] as Long
         val encrypted = engine.resolve(origin.encryptedUrl, ProxyEngine.ResolveOptions("enc|1", headers, prewarm = false))
@@ -944,6 +950,84 @@ private fun testEngineLifecycle() {
         origin.stop()
         cleanup(dir)
         cleanup(zeroDir)
+    }
+}
+
+private fun testEnginePrefetchState() {
+    group("ProxyEngine: prefetch/state/события")
+    val origin = FixtureOrigin().start()
+    val dir = tempDir()
+    val engine = ProxyEngine(File(dir, "engine"))
+    val events = mutableListOf<Pair<String, Map<String, Any?>>>()
+    engine.onEvent = { name, payload -> synchronized(events) { events.add(name to payload) } }
+    try {
+        engine.setConfig(
+            testConfig(
+                mapOf(
+                    "prefetchMaxSegments" to 2,
+                    "prefetchSeconds" to 30,
+                    "prewarmSegments" to 1,
+                    "prefetchConcurrency" to 2,
+                    "interactiveConcurrency" to 2,
+                ),
+            ),
+        )
+        engine.start()
+        truth(
+            "onServerState при старте",
+            waitUntil(1000) {
+                synchronized(events) { events.any { it.first == "onServerState" && it.second["running"] == true } }
+            },
+        )
+
+        val headers = mapOf("User-Agent" to "ProxyTest/1.0")
+        val resolved = engine.resolve(origin.mediaUrl, ProxyEngine.ResolveOptions("pf|1", headers))
+        val playlist = httpGet(resolved.url)
+        eq("prefetch playlist", 200, playlist.status)
+        val segment0 = firstSegment(String(playlist.body))
+        eq("prefetch segment 0", 200, httpGet(segment0).status)
+        truth(
+            "prefetch сегмента 1",
+            waitUntil(4000) {
+                @Suppress("UNCHECKED_CAST")
+                val segments = engine.streamState(resolved.streamId)["segments"] as List<Map<String, Any?>>
+                segments.getOrNull(1)?.get("complete") == true
+            }.also { ok ->
+                if (!ok) {
+                    val dirs = File(dir, "engine").walkTopDown()
+                        .filter { it.isFile }
+                        .joinToString { "${it.relativeTo(File(dir, "engine"))}:${it.length()}" }
+                    println(
+                        "DEBUG prefetch: state=${engine.streamState(resolved.streamId)} " +
+                            "stats=${engine.stats()} hits1=${origin.hits("seg-1")} hits2=${origin.hits("seg-2")} " +
+                            "files=$dirs",
+                    )
+                }
+            },
+        )
+        val state = engine.streamState(resolved.streamId)
+        truth("cachedAheadSec > 0", (state["cachedAheadSec"] as Double) > 0)
+        truth("stats prefetched > 0", (engine.stats()["prefetched"] as Long) > 0)
+        truth(
+            "prefetch сегмента 2",
+            waitUntil(4000) {
+                @Suppress("UNCHECKED_CAST")
+                val segments = engine.streamState(resolved.streamId)["segments"] as List<Map<String, Any?>>
+                segments.getOrNull(2)?.get("complete") == true
+            },
+        )
+        truth("prefetch учтён один раз", waitUntil(3000) { (engine.stats()["prefetched"] as Long) == 3L })
+        truth("nudge не падает", (engine.nudge(resolved.streamId)["queued"] as? Int ?: 0) >= 0)
+        truth("streamState неизвестного id", engine.streamState("nope").containsKey("segments"))
+
+        engine.release(resolved.streamId)
+        eq("после release 410", 410, httpGet(segment0).status)
+        engine.stop()
+        truth("resolve после stop → cached:false", !engine.resolve(origin.mediaUrl, ProxyEngine.ResolveOptions()).cached)
+    } finally {
+        engine.stop()
+        origin.stop()
+        cleanup(dir)
     }
 }
 
