@@ -234,11 +234,11 @@ class ProxyEngine(private val root: File) {
         )
         synchronized(sessions) {
             sessions[sid] = session
+            // Вытесняем только ДРУГИЕ сессии: при равных timestamp minByOrNull мог вернуть новую.
             while (sessions.size > config.maxSessions) {
-                val oldest = sessions.values.minByOrNull { it.lastAccess } ?: break
-                if (oldest.id == sid) break
-                sessions.remove(oldest.id)
-                releaseSessionResources(oldest)
+                val victim = sessions.values.filter { it.id != sid }.minByOrNull { it.lastAccess } ?: break
+                sessions.remove(victim.id)
+                releaseSessionResources(victim)
             }
         }
         val url = proxyUrl(session, originUrl, ResourceKind.PLAYLIST, srv.boundPort)
