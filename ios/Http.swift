@@ -1,0 +1,197 @@
+import Foundation
+
+public enum ResourceKind {
+    case playlist
+    case segment
+    case key
+
+    /// Расширение в loopback-URL обязательно: AVURLAsset выбирает демуксер по расширению/UTI.
+    public var fallbackExtension: String {
+        switch self {
+        case .playlist: return "m3u8"
+        case .segment: return "ts"
+        case .key: return "key"
+        }
+    }
+}
+
+public enum ProxyErrorCode: String {
+    case notStarted = "NOT_STARTED"
+    case serverStartFailed = "SERVER_START_FAILED"
+    case invalidUrl = "INVALID_URL"
+    case sessionUnknown = "SESSION_UNKNOWN"
+    case connectFailed = "CONNECT_FAILED"
+    case timeoutFirstByte = "TIMEOUT_FIRST_BYTE"
+    case timeoutSilence = "TIMEOUT_SILENCE"
+    case slowStream = "SLOW_STREAM"
+    case origin400 = "ORIGIN_400"
+    case origin401 = "ORIGIN_401"
+    case origin403 = "ORIGIN_403"
+    case origin404 = "ORIGIN_404"
+    case origin410 = "ORIGIN_410"
+    case origin429 = "ORIGIN_429"
+    case origin5xx = "ORIGIN_5XX"
+    case htmlResponse = "HTML_RESPONSE"
+    case emptyResponse = "EMPTY_RESPONSE"
+    case truncated = "TRUNCATED"
+    case badContent = "BAD_CONTENT"
+    case rangeUnsupported = "RANGE_UNSUPPORTED"
+    case budgetExhausted = "BUDGET_EXHAUSTED"
+    case diskFull = "DISK_FULL"
+    case diskIO = "DISK_IO"
+    case cacheEvicted = "CACHE_EVICTED"
+    case unsupportedPlaylist = "UNSUPPORTED_PLAYLIST"
+    case networkChanged = "NETWORK_CHANGED"
+    case cleartextBlocked = "CLEARTEXT_BLOCKED"
+    case atsBlocked = "ATS_BLOCKED"
+
+    public var isAuth: Bool {
+        switch self {
+        case .origin400, .origin401, .origin403, .origin410: return true
+        default: return false
+        }
+    }
+
+    public var isRetryable: Bool {
+        switch self {
+        case .connectFailed, .timeoutFirstByte, .timeoutSilence, .slowStream,
+             .origin429, .origin5xx, .truncated, .emptyResponse, .networkChanged:
+            return true
+        default:
+            return false
+        }
+    }
+
+    public var httpStatus: Int {
+        switch self {
+        case .timeoutFirstByte, .timeoutSilence, .slowStream: return 504
+        case .origin429: return 503
+        case .invalidUrl: return 400
+        case .sessionUnknown: return 410
+        case .diskFull, .diskIO: return 500
+        default: return 502
+        }
+    }
+}
+
+public enum Http {
+    public static let statusText: [Int: String] = [
+        200: "OK", 206: "Partial Content", 400: "Bad Request", 403: "Forbidden",
+        404: "Not Found", 410: "Gone", 416: "Range Not Satisfiable", 429: "Too Many Requests",
+        500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable",
+        504: "Gateway Timeout",
+    ]
+
+    /// Разбор одного `Range`. Возвращает `nil`, если диапазонов несколько (тогда отдаём 200 целиком)
+    /// или заголовок не распознан. `(start, end)` — включительно; `bad` = 416.
+    public static func parseRange(_ header: String?, total: Int64) -> (start: Int64, end: Int64)? {
+        guard let header, total > 0 else { return nil }
+        let value = header.trimmingCharacters(in: .whitespaces)
+        guard value.lowercased().hasPrefix("bytes=") else { return nil }
+        let spec = value.dropFirst("bytes=".count)
+        if spec.contains(",") { return nil }
+        let parts = spec.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return nil }
+        let left = parts[0].trimmingCharacters(in: .whitespaces)
+        let right = parts[1].trimmingCharacters(in: .whitespaces)
+
+        if left.isEmpty {
+            // suffix: bytes=-N
+            guard let n = Int64(right), n > 0 else { return nil }
+            let start = max(0, total - n)
+            return (start, total - 1)
+        }
+        guard let start = Int64(left), start >= 0, start < total else { return nil }
+        if right.isEmpty { return (start, total - 1) }
+        guard let rawEnd = Int64(right) else { return nil }
+        let end = min(rawEnd, total - 1)
+        if end < start { return nil }
+        return (start, end)
+    }
+
+    /// Валидный ли origin-URL. Только http(s); loopback запрещён (иначе прокси уходит в себя).
+    public static func isAllowedOrigin(_ raw: String) -> Bool {
+        guard let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host, !host.isEmpty else { return false }
+        let lowered = host.lowercased()
+        if lowered == "localhost" || lowered == "127.0.0.1" || lowered == "::1" { return false }
+        return true
+    }
+
+    public static func contentType(forExtension ext: String) -> String {
+        switch ext.lowercased() {
+        case "m3u8", "m3u": return "application/vnd.apple.mpegurl"
+        case "ts": return "video/mp2t"
+        case "m4s": return "video/iso.segment"
+        case "mp4", "m4v": return "video/mp4"
+        case "aac": return "audio/aac"
+        case "vtt": return "text/vtt"
+        case "key": return "application/octet-stream"
+        default: return "application/octet-stream"
+        }
+    }
+
+    public static func safeName(for url: URL, kind: ResourceKind) -> String {
+        var ext = url.pathExtension.lowercased()
+        if kind == .playlist { ext = "m3u8" }
+        if ext.isEmpty { ext = kind.fallbackExtension }
+        // оставляем только разумные символы, длина имени ограничена
+        var base = url.deletingPathExtension().lastPathComponent
+        base = base.replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "_", options: .regularExpression)
+        if base.isEmpty || base.count > 48 { base = "r" }
+        return "\(base).\(ext)"
+    }
+
+    public static func resourceKind(extension ext: String, contentType: String?, isInit: Bool = false) -> ResourceKind {
+        let e = ext.lowercased()
+        if e == "m3u8" || e == "m3u" { return .playlist }
+        if e == "key" { return .key }
+        let ct = contentType?.lowercased() ?? ""
+        if ct.contains("mpegurl") { return .playlist }
+        if ct.contains("octet-stream") && isInit { return .segment }
+        return .segment
+    }
+}
+
+/// Небольшая обёртка над файловыми операциями: одинаковые UTF-8/append/truncate на обеих платформах.
+public enum Fs {
+    public static func ensureDir(_ url: URL) throws {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    }
+
+    public static func size(_ url: URL) -> Int64 {
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
+    }
+
+    public static func removeIfExists(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    public static func appendLine(_ url: URL, _ line: String) throws {
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try Data().write(to: url)
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((line + "\n").utf8))
+    }
+
+    public static func readLines(_ url: URL) -> [String] {
+        guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+    }
+
+    public static func truncate(_ url: URL, to size: Int64) {
+        guard FileManager.default.fileExists(atPath: url.path), Fs.size(url) > size else { return }
+        guard let handle = try? FileHandle(forWritingTo: url) else { return }
+        defer { try? handle.close() }
+        try? handle.truncate(atOffset: UInt64(max(0, size)))
+    }
+
+    public static func freeDiskBytes(at url: URL) -> Int64 {
+        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return values?.volumeAvailableCapacityForImportantUsage ?? 0
+    }
+}
