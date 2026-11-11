@@ -521,6 +521,7 @@ class ProxyEngine(private val root: File) {
                     val total = download.feed.total
                     val written = download.feed.written
                     download.feed.finish()
+                    cache.ensureEntry(download.stream, download.segment.index, nowMs())
                     cache.update(download.stream, download.segment.index) {
                         it.total = total
                         it.prefix = written
@@ -554,6 +555,7 @@ class ProxyEngine(private val root: File) {
                 val written = download.feed.written
                 val total = download.feed.total
                 download.feed.fail(code)
+                cache.ensureEntry(download.stream, download.segment.index, nowMs())
                 cache.update(download.stream, download.segment.index) {
                     it.total = total
                     it.prefix = written
@@ -606,6 +608,9 @@ class ProxyEngine(private val root: File) {
             downloads[key] = download
             prefetched.add(marker)
             cache.retain(stream)
+            // У prefetch нет «запроса плеера», который создал бы запись: без ensureEntry update ниже
+            // молча ничего не делает, и сегмент скачан, но кэш о нём не знает.
+            cache.ensureEntry(stream, segment.index, nowMs())
             cache.update(stream, segment.index) {
                 it.downloading = true
                 it.total = -1
