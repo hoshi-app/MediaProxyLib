@@ -100,12 +100,10 @@ class ProxyEngine(private val root: File) {
     private val downloadsLock = Any()
     private val prefetched = HashSet<String>()
 
-    private val interactive = ThreadPoolExecutor(4, 4, 30, TimeUnit.SECONDS, LinkedBlockingQueue())
-    private val prefetchPool = ThreadPoolExecutor(2, 2, 30, TimeUnit.SECONDS, LinkedBlockingQueue())
-    private val loader = ThreadPoolExecutor(1, 1, 30, TimeUnit.SECONDS, LinkedBlockingQueue())
-    private val passPool = Executors.newCachedThreadPool { runnable ->
-        Thread(runnable, "mediaproxy-pass").apply { isDaemon = true }
-    }
+    private var interactive = ThreadPoolExecutor(4, 4, 30, TimeUnit.SECONDS, LinkedBlockingQueue())
+    private var prefetchPool = ThreadPoolExecutor(2, 2, 30, TimeUnit.SECONDS, LinkedBlockingQueue())
+    private var loader = ThreadPoolExecutor(1, 1, 30, TimeUnit.SECONDS, LinkedBlockingQueue())
+    private var passPool: java.util.concurrent.ExecutorService = createPassPool()
 
     private val hits = AtomicLong(0)
     private val misses = AtomicLong(0)
@@ -141,6 +139,7 @@ class ProxyEngine(private val root: File) {
             server = http
             running = true
             generation++
+            ensurePools()
             resizePools()
             emit(
                 "onServerState",
@@ -192,6 +191,25 @@ class ProxyEngine(private val root: File) {
         prefetchPool.corePoolSize = config.prefetchConcurrency
         prefetchPool.maximumPoolSize = config.prefetchConcurrency
     }
+
+    /**
+     * stop() гасит пулы; start() после stop() обязан их пересоздать, иначе первый же сегмент
+     * получит RejectedExecutionException и плеер — обрыв (рестарт сервера после фона/ошибки).
+     */
+    private fun ensurePools() {
+        if (interactive.isShutdown) interactive = createPool(config.interactiveConcurrency)
+        if (prefetchPool.isShutdown) prefetchPool = createPool(config.prefetchConcurrency)
+        if (loader.isShutdown) loader = createPool(1)
+        if (passPool.isShutdown) passPool = createPassPool()
+    }
+
+    private fun createPool(size: Int): ThreadPoolExecutor =
+        ThreadPoolExecutor(size, size, 30, TimeUnit.SECONDS, LinkedBlockingQueue())
+
+    private fun createPassPool(): java.util.concurrent.ExecutorService =
+        Executors.newCachedThreadPool { runnable ->
+            Thread(runnable, "mediaproxy-pass").apply { isDaemon = true }
+        }
 
     // MARK: - resolve / release
 
