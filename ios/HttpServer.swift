@@ -102,20 +102,23 @@ public struct GrowingFileBody: HttpResponseBody {
     }
 }
 
-/// Pass-through: отдаём по мере прихода из памяти (без диска).
+/// Pass-through: отдаём по мере прихода из памяти (без диска). Тело не должно оказаться короче
+/// обещанного `Content-Length`: при провале рвём соединение, иначе плеер ждёт хвост.
 public struct StreamBody: HttpResponseBody {
     let feed: ByteFeed
     public init(feed: ByteFeed) { self.feed = feed }
     public func write(to fd: Int32, offset: Int64, count: Int64, deadline: TimeInterval) throws {
-        while true {
-            guard let chunk = feed.readChunk(maxBytes: 64 * 1024, timeout: max(0.1, deadline - Date().timeIntervalSince1970)) else {
-                return  // завершено
-            }
-            if chunk.isEmpty {
-                if feed.isFinished { return }
-                continue
-            }
+        var sent: Int64 = 0
+        while count < 0 || sent < count {
+            let left = deadline - Date().timeIntervalSince1970
+            if left <= 0 { throw POSIXError(.ETIMEDOUT) }
+            guard let chunk = feed.readChunk(maxBytes: 64 * 1024, timeout: max(0.1, left)) else { break }
+            if chunk.isEmpty { continue }
             try sendAll(fd, chunk)
+            sent += Int64(chunk.count)
+        }
+        if count >= 0 && sent < count {
+            throw POSIXError(.ECONNRESET)
         }
     }
 }
@@ -220,9 +223,13 @@ public final class HttpServer {
                 continue
             }
             if semaphore.wait(timeout: .now()) == .timedOut {
-                // Слишком много соединений — отвечаем 503 и закрываем, а не рвём молча.
-                _ = try? HttpReply.text(503, "Too many connections").body?.write(
-                    to: clientFD, offset: 0, count: -1, deadline: Date().timeIntervalSince1970 + 2)
+                // Слишком много соединений — отвечаем полноценным 503, а не голым телом.
+                let text = "Too many connections"
+                let body = Data(text.utf8)
+                let head = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\n" +
+                    "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+                _ = try? sendAllData(clientFD, Data(head.utf8))
+                _ = try? sendAllData(clientFD, body)
                 Darwin.close(clientFD)
                 continue
             }
@@ -304,23 +311,27 @@ public final class HttpServer {
         var offset: Int64 = 0
         var count: Int64 = length
 
-        if !reply.rangeHandled, length >= 0, let parsed = Http.parseRange(request.range, total: length) {
-            status = 206
-            offset = parsed.start
-            count = parsed.end - parsed.start + 1
-            headers["Content-Range"] = "bytes \(parsed.start)-\(parsed.end)/\(length)"
-            length = count
-        } else if !reply.rangeHandled, request.range != nil, length >= 0,
-                  Http.parseRange(request.range, total: length) == nil,
-                  let raw = request.range, raw.lowercased().hasPrefix("bytes=") {
-            // Диапазон запрошен, но невалиден — 416.
-            let head = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */\(length)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            _ = try? sendAllData(fd, Data(head.utf8))
-            return false
+        if !reply.rangeHandled, length >= 0 {
+            switch Http.parseRange(request.range, total: length) {
+            case .valid(let start, let end):
+                status = 206
+                offset = start
+                count = end - start + 1
+                headers["Content-Range"] = "bytes \(start)-\(end)/\(length)"
+                length = count
+            case .unsatisfiable:
+                let head = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */\(length)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                _ = try? sendAllData(fd, Data(head.utf8))
+                return false
+            case .none:
+                break
+            }
         }
 
         headers["Accept-Ranges"] = length >= 0 ? "bytes" : "none"
-        headers["Connection"] = request.keepAlive ? "keep-alive" : "close"
+        // Close-delimited ответ обязан объявить `Connection: close`: сервер закроет сокет сразу
+        // после тела, и клиент не должен пытаться переиспользовать соединение.
+        headers["Connection"] = (request.keepAlive && length >= 0) ? "keep-alive" : "close"
         headers["Content-Length"] = length >= 0 ? String(length) : ""
         if let state = reply.cacheState, headers["X-MediaProxy-Cache"] == nil {
             headers["X-MediaProxy-Cache"] = state

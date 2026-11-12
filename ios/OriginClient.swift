@@ -35,7 +35,10 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         var windowStart = Date()
         var receivedAny = false
         var finished = false
-        var completion: ((ProxyErrorCode?) -> Void)?
+        var setCookies: [String] = []
+        var baseline: Int64 = 0
+        var rangeStart: Int64 = 0
+        var completion: ((ProxyErrorCode?, [String]) -> Void)?
         init(feed: ByteFeed, profile: TimeoutProfile, isPrefetch: Bool) {
             self.feed = feed
             self.profile = profile
@@ -68,11 +71,19 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
     // MARK: - segment / resource streaming
 
     @discardableResult
-    public func open(_ request: Request, feed: ByteFeed, completion: @escaping (ProxyErrorCode?) -> Void) -> Call {
+    public func open(_ request: Request, feed: ByteFeed,
+                     completion: @escaping (ProxyErrorCode?, [String]) -> Void) -> Call {
         let call = Call(feed: feed, profile: request.profile, isPrefetch: request.isPrefetch)
         call.completion = completion
+        call.baseline = feed.written
+        call.rangeStart = request.rangeStart
 
-        var req = URLRequest(url: URL(string: request.url)!)
+        guard let url = URL(string: request.url) else {
+            feed.fail(.invalidUrl)
+            completion(.invalidUrl, [])
+            return call
+        }
+        var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.cachePolicy = .reloadIgnoringLocalCacheData
         for (key, value) in request.headers {
@@ -84,8 +95,9 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         if request.rangeStart > 0 {
             req.setValue("bytes=\(request.rangeStart)-", forHTTPHeaderField: "Range")
+            // Если ресурс сменился, origin обязан ответить 200 с целым телом — префикс не склеим.
+            if let ifRange = request.ifRange { req.setValue(ifRange, forHTTPHeaderField: "If-Range") }
         }
-        if let ifRange = request.ifRange { req.setValue(ifRange, forHTTPHeaderField: "If-Range") }
 
         let task = session.dataTask(with: req)
         call.task = task
@@ -106,8 +118,9 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
     // MARK: - playlist (bounded, синхронно)
 
     public func fetchPlaylist(url: String, headers: [String: String], profile: TimeoutProfile,
-                              maxBytes: Int) -> (data: Data?, finalUrl: String?, contentType: String?, error: ProxyErrorCode?) {
-        var req = URLRequest(url: URL(string: url)!)
+                              maxBytes: Int) -> (data: Data?, finalUrl: String?, contentType: String?, error: ProxyErrorCode?, cookies: [String]) {
+        guard let parsed = URL(string: url) else { return (nil, nil, nil, .invalidUrl, []) }
+        var req = URLRequest(url: parsed)
         req.httpMethod = "GET"
         req.cachePolicy = .reloadIgnoringLocalCacheData
         req.timeoutInterval = max(1, profile.firstByteMs / 1000)
@@ -120,26 +133,45 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
 
         let semaphore = DispatchSemaphore(value: 0)
-        var result: (Data?, String?, String?, ProxyErrorCode?) = (nil, nil, nil, .connectFailed)
+        var result: (Data?, String?, String?, ProxyErrorCode?, [String]) = (nil, nil, nil, .connectFailed, [])
         let task = session.dataTask(with: req) { data, response, error in
             defer { semaphore.signal() }
             if let error {
-                result = (nil, nil, nil, OriginClient.map(error))
+                result = (nil, nil, nil, OriginClient.map(error), [])
                 return
             }
             guard let http = response as? HTTPURLResponse else {
-                result = (nil, nil, nil, .connectFailed); return
+                result = (nil, nil, nil, .connectFailed, []); return
             }
+            let cookies = OriginClient.cookies(from: http)
+            let contentType = http.value(forHTTPHeaderField: "Content-Type")
             guard http.statusCode == 200 || http.statusCode == 206 else {
-                result = (nil, http.url?.absoluteString, http.value(forHTTPHeaderField: "Content-Type"),
-                          OriginClient.code(for: http.statusCode)); return
+                result = (nil, http.url?.absoluteString, contentType,
+                          OriginClient.code(for: http.statusCode), cookies); return
             }
-            guard let data else { result = (nil, nil, nil, .emptyResponse); return }
-            if data.count > maxBytes { result = (nil, nil, nil, .badContent); return }
-            result = (data, http.url?.absoluteString, http.value(forHTTPHeaderField: "Content-Type"), nil)
+            // HTML-страница ошибки вместо плейлиста обязана стать событием, а не 200 (§6.4).
+            if let contentType, contentType.lowercased().contains("text/html") {
+                result = (nil, http.url?.absoluteString, contentType, .htmlResponse, cookies); return
+            }
+            guard let data else { result = (nil, nil, nil, .emptyResponse, cookies); return }
+            if data.count > maxBytes { result = (nil, nil, nil, .badContent, cookies); return }
+            result = (data, http.url?.absoluteString, contentType, nil, cookies)
         }
         task.resume()
-        _ = semaphore.wait(timeout: .now() + max(1, profile.firstByteMs / 1000 + 60))
+        // Таймаут + небольшой запас; при истечении задачу гасим, чтобы не держать соединение.
+        if semaphore.wait(timeout: .now() + Double(max(1, profile.firstByteMs / 1000 + 60))) == .timedOut {
+            task.cancel()
+            return (nil, nil, nil, .timeoutFirstByte, [])
+        }
+        return result
+    }
+
+    private static func cookies(from http: HTTPURLResponse) -> [String] {
+        var result: [String] = []
+        for (key, value) in http.allHeaderFields {
+            guard let name = key as? String, name.lowercased() == "set-cookie" else { continue }
+            if let text = value as? String { result.append(text) }
+        }
         return result
     }
 
@@ -154,6 +186,7 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         }
         let contentType = http.value(forHTTPHeaderField: "Content-Type")
         let loweredType = contentType?.lowercased() ?? ""
+        call.setCookies = OriginClient.cookies(from: http)
         if loweredType.contains("text/html") {
             finish(call, error: .htmlResponse); completionHandler(.cancel); return
         }
@@ -171,9 +204,18 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         }
 
         var total = http.expectedContentLength
-        if http.statusCode == 206, let cr = http.value(forHTTPHeaderField: "Content-Range"),
-           let slash = cr.lastIndex(of: "/"), let t = Int64(cr[cr.index(after: slash)...].trimmingCharacters(in: .whitespaces)) {
-            total = t
+        if http.statusCode == 206 {
+            // 206 без валидного Content-Range не принимаем: иначе `total` подменится длиной тела,
+            // и склейка префикса с чужим хвостом будет помечена как complete.
+            guard let cr = http.value(forHTTPHeaderField: "Content-Range"),
+                  let parsed = OriginClient.parseContentRange(cr),
+                  parsed.start == call.rangeStart,
+                  !(parsed.total >= 0 && parsed.total < call.rangeStart) else {
+                finish(call, error: .rangeUnsupported)
+                completionHandler(.cancel)
+                return
+            }
+            total = parsed.total
         }
         if total < 0 { total = -1 }
         call.feed.setMeta(total: total, contentType: contentType,
@@ -213,7 +255,10 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
             return
         }
         let total = call.feed.total
-        if total >= 0 && written != total {
+        // Ожидаем `baseline + длина тела`: у 206 `total` — размер всего ресурса, поэтому при
+        // Range ≠ 0 ожидание = total - rangeStart (иначе любой 206 ложно был бы TRUNCATED).
+        let expected = total >= 0 ? call.baseline + (total - call.rangeStart) : -1
+        if expected >= 0 && written != expected {
             finish(call, error: .truncated)
             return
         }
@@ -285,10 +330,23 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         call.silenceTimer?.cancel()
         call.speedTimer?.cancel()
         if let error { call.feed.fail(error) } else { call.feed.finish() }
-        call.completion?(error)
+        call.completion?(error, call.setCookies)
         if let task = call.task {
             lock.lock(); calls.removeValue(forKey: task.taskIdentifier); lock.unlock()
         }
+    }
+
+    /// `Content-Range: bytes 100-999/1000` (total может быть `*` → -1).
+    static func parseContentRange(_ header: String) -> (start: Int64, end: Int64, total: Int64)? {
+        let parts = header.split(separator: " ")
+        guard parts.count >= 2, parts[0].lowercased() == "bytes" else { return nil }
+        let halves = parts[1].split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard halves.count == 2 else { return nil }
+        let range = halves[0].split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard range.count == 2, let start = Int64(range[0]), let end = Int64(range[1]) else { return nil }
+        let totalText = halves[1].trimmingCharacters(in: .whitespaces)
+        let total: Int64 = totalText == "*" ? -1 : (Int64(totalText) ?? -1)
+        return (start, end, total)
     }
 
     public static func code(for status: Int) -> ProxyErrorCode {

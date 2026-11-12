@@ -21,9 +21,11 @@ public final class MediaProxyModule: Module {
                 return ["port": 0, "baseUrl": "", "generation": engine.currentGeneration,
                         "issues": ["SERVER_START_FAILED"]]
             }
-            self.preflight(engine: engine)
+            // Preflight синхронный (с коротким таймаутом): ATS-блокировка loopback должна быть
+            // видна в `issues` сразу, а не асинхронным событием после старта (§8.1).
+            let issues = self.preflight(engine: engine)
             return ["port": result.port, "baseUrl": engine.baseUrl,
-                    "generation": engine.currentGeneration, "issues": [String]()]
+                    "generation": engine.currentGeneration, "issues": issues]
         }
 
         Function("resolve") { (origin: String, options: [String: Any]) -> [String: Any] in
@@ -83,31 +85,31 @@ public final class MediaProxyModule: Module {
     }
 
     /// HEAD на собственный сервер: ловит -1022 (ATS) до того, как это сделает плеер.
-    private func preflight(engine: ProxyEngine) {
-        guard let url = URL(string: engine.baseUrl + "/") else { return }
+    /// Синхронно, с коротким таймаутом: результат уходит в `start().issues`.
+    private func preflight(engine: ProxyEngine) -> [String] {
+        guard let url = URL(string: engine.baseUrl + "/") else { return [] }
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
-        request.timeoutInterval = 3
-        let task = URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+        request.timeoutInterval = 2
+        let semaphore = DispatchSemaphore(value: 0)
+        var issue: String?
+        let task = URLSession.shared.dataTask(with: request) { _, response, error in
+            defer { semaphore.signal() }
             if let error {
                 let ns = error as NSError
-                if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorAppTransportSecurityRequiresSecureConnection {
-                    self?.sendEvent("onError", [
-                        "code": "ATS_BLOCKED", "streamId": "", "url": engine.baseUrl,
-                        "originStatus": 0, "attempt": 1, "retryable": false, "fatal": true,
-                        "message": "NSAllowsLocalNetworking не включён",
-                    ])
-                    return
-                }
-                if response == nil {
-                    self?.sendEvent("onError", [
-                        "code": "CONNECT_FAILED", "streamId": "", "url": engine.baseUrl,
-                        "originStatus": 0, "attempt": 1, "retryable": true, "fatal": false,
-                        "message": ns.localizedDescription,
-                    ])
+                if ns.domain == NSURLErrorDomain,
+                   ns.code == NSURLErrorAppTransportSecurityRequiresSecureConnection {
+                    issue = "ATS_BLOCKED"
+                } else if response == nil {
+                    issue = "CONNECT_FAILED"
                 }
             }
         }
         task.resume()
+        if semaphore.wait(timeout: .now() + 2) == .timedOut {
+            task.cancel()
+            return []
+        }
+        return issue.map { [$0] } ?? []
     }
 }

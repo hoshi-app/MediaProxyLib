@@ -15,16 +15,25 @@ public final class ByteFeed {
     private var etag: String?
     private var memory = Data()
     private var firstBytes = Data()
+    private var metaReady = false
 
-    public init(file: URL?) {
+    /// - Parameter resumeFrom: сколько байт уже лежит на диске (докачка с префикса). `0` — с нуля.
+    public init(file: URL?, resumeFrom: Int64 = 0) {
         self.file = file
         if let file {
             try? Fs.ensureDir(file.deletingLastPathComponent())
             if !FileManager.default.fileExists(atPath: file.path) {
                 FileManager.default.createFile(atPath: file.path, contents: nil)
             }
+            let size = Fs.size(file)
+            let resume = min(max(0, resumeFrom), size)
             handle = try? FileHandle(forWritingTo: file)
-            try? handle?.truncate(atOffset: 0)
+            if resume > 0 {
+                writtenBytes = resume
+                try? handle?.seekToEnd()
+            } else {
+                try? handle?.truncate(atOffset: 0)
+            }
         }
     }
 
@@ -79,6 +88,7 @@ public final class ByteFeed {
         self.contentType = contentType
         self.finalUrl = finalUrl
         self.etag = etag
+        metaReady = true
         condition.broadcast()
         condition.unlock()
     }
@@ -109,6 +119,20 @@ public final class ByteFeed {
         if failure == nil { failure = code }
         condition.broadcast()
         condition.unlock()
+    }
+
+    /// Ждёт метаданные ответа. Учитывает докачку: `written` может быть > 0 сразу (префикс на диске),
+    /// и ждать «первый байт» в этом случае бессмысленно — нужен именно `total`.
+    public func waitForMeta(timeout: TimeInterval) -> ProxyErrorCode? {
+        let limit = Date().addingTimeInterval(max(0, timeout))
+        condition.lock()
+        defer { condition.unlock() }
+        while !metaReady && failure == nil && !finished {
+            if !condition.wait(until: limit) { return failure ?? .timeoutFirstByte }
+        }
+        if let failure { return failure }
+        if !metaReady && finished && writtenBytes == 0 { return .emptyResponse }
+        return nil
     }
 
     /// Ждёт первый байт/ошибку. `nil` = дождались, иначе код ошибки (включая таймаут).

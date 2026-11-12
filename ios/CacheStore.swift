@@ -10,6 +10,8 @@ public final class CacheStore {
         public var complete: Bool
         public var failedUntil: TimeInterval = 0
         public var contentType: String?
+        /// ETag ответа origin: нужен для `If-Range` при докачке с префикса.
+        public var etag: String? = nil
         public var downloading: Bool = false
         public var feed: ByteFeed? = nil
         public var file: URL
@@ -39,6 +41,7 @@ public final class CacheStore {
     private let root: URL
     private let lock = NSRecursiveLock()
     private var streams: [String: Stream] = [:]
+    private var evictedStreams: Int64 = 0
     private let config: () -> ProxyConfig
     private let diskFree: () -> Int64
 
@@ -162,8 +165,15 @@ public final class CacheStore {
             candidate.pendingDelete = true
             streams.removeValue(forKey: candidate.key)
             Fs.removeIfExists(candidate.dir)
+            evictedStreams += 1
         }
         return totalBytesLocked() + required <= cfg.maxCacheBytes
+    }
+
+    /// Сколько стримов вытеснено с момента старта — для `getStats().evictions`.
+    public func evictedCount() -> Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return evictedStreams
     }
 
     private func totalBytesLocked() -> Int64 {
@@ -197,6 +207,15 @@ public final class CacheStore {
     private func load(_ stream: Stream) {
         let journalURL = stream.dir.appendingPathComponent("journal.log")
         let lines = Fs.readLines(journalURL)
+        // Шапка — единственный способ после рестарта процесса отличить «тот же контент» от другого
+        // плейлиста с тем же cacheKey (PROTOCOL §3). Формат H|2: отпечаток ПЕРЕД cacheKey, потому
+        // что cacheKey приложения содержит `|` (`t1|p-x|e2|q720`) и разбирать его на части нельзя.
+        let header = lines.last { $0.hasPrefix("H|") }
+        let hasSegments = lines.contains { $0.hasPrefix("S|") }
+        if hasSegments && !headerMatches(header, stream: stream) {
+            wipe(stream)
+            return
+        }
         // Append-only журнал: последняя запись по индексу побеждает, сверка с файлом — один раз на запись.
         var latest: [Int: Entry] = [:]
         for line in lines {
@@ -233,9 +252,29 @@ public final class CacheStore {
         rewriteJournal(stream)
     }
 
+    private func headerMatches(_ line: String?, stream: Stream) -> Bool {
+        guard let line else { return false }
+        let parts = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 4, parts[0] == "H", parts[1] == "2" else { return false }
+        let fingerprint = parts[2]
+        let cacheKey = parts.dropFirst(3).joined(separator: "|")
+        return fingerprint == stream.fingerprint && cacheKey == stream.cacheKey
+    }
+
+    /// Снос невалидного каталога: чужие/битые записи не должны пережить смену плейлиста.
+    private func wipe(_ stream: Stream) {
+        stream.entries.removeAll()
+        if let files = try? FileManager.default.contentsOfDirectory(atPath: stream.dir.path) {
+            for file in files where file.hasSuffix(".bin") || file == "journal.log" {
+                Fs.removeIfExists(stream.dir.appendingPathComponent(file))
+            }
+        }
+        rewriteJournal(stream)
+    }
+
     private func rewriteJournal(_ stream: Stream) {
         let url = stream.dir.appendingPathComponent("journal.log")
-        var text = "H|1|\(stream.cacheKey)|\(stream.fingerprint)\n"
+        var text = "H|2|\(stream.fingerprint)|\(stream.cacheKey)\n"
         for e in stream.entries.values.sorted(by: { $0.index < $1.index }) {
             text += "S|\(e.index)|\(e.total)|\(e.prefix)|\(e.complete ? 1 : 0)|\(e.contentType ?? "")|\(Int(e.lastAccess))|\(e.index)\n"
         }

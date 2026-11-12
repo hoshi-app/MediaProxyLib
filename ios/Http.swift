@@ -82,31 +82,49 @@ public enum Http {
         504: "Gateway Timeout",
     ]
 
-    /// Разбор одного `Range`. Возвращает `nil`, если диапазонов несколько (тогда отдаём 200 целиком)
-    /// или заголовок не распознан. `(start, end)` — включительно; `bad` = 416.
-    public static func parseRange(_ header: String?, total: Int64) -> (start: Int64, end: Int64)? {
-        guard let header, total > 0 else { return nil }
+    /// Трёхзначный разбор `Range`: «несколько диапазонов/не распознан» (отдаём 200 целиком) —
+    /// это не то же самое, что «диапазон за пределом ресурса» (416).
+    public enum RangeResult {
+        case none
+        case valid(start: Int64, end: Int64)
+        case unsatisfiable
+    }
+
+    public static func parseRange(_ header: String?, total: Int64) -> RangeResult {
+        guard let header, total > 0 else { return .none }
         let value = header.trimmingCharacters(in: .whitespaces)
-        guard value.lowercased().hasPrefix("bytes=") else { return nil }
+        guard value.lowercased().hasPrefix("bytes=") else { return .none }
         let spec = value.dropFirst("bytes=".count)
-        if spec.contains(",") { return nil }
+        if spec.contains(",") { return .none }
         let parts = spec.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
-        guard parts.count == 2 else { return nil }
+        guard parts.count == 2 else { return .unsatisfiable }
         let left = parts[0].trimmingCharacters(in: .whitespaces)
         let right = parts[1].trimmingCharacters(in: .whitespaces)
 
         if left.isEmpty {
             // suffix: bytes=-N
-            guard let n = Int64(right), n > 0 else { return nil }
+            guard let n = Int64(right), n > 0 else { return .unsatisfiable }
             let start = max(0, total - n)
-            return (start, total - 1)
+            return .valid(start: start, end: total - 1)
         }
-        guard let start = Int64(left), start >= 0, start < total else { return nil }
-        if right.isEmpty { return (start, total - 1) }
-        guard let rawEnd = Int64(right) else { return nil }
+        guard let start = Int64(left), start >= 0, start < total else { return .unsatisfiable }
+        if right.isEmpty { return .valid(start: start, end: total - 1) }
+        guard let rawEnd = Int64(right) else { return .unsatisfiable }
         let end = min(rawEnd, total - 1)
-        if end < start { return nil }
-        return (start, end)
+        if end < start { return .unsatisfiable }
+        return .valid(start: start, end: end)
+    }
+
+    /// Начало диапазона для pass-through; 0 — если диапазона нет/он не распознан (в т.ч. suffix).
+    public static func rangeStart(_ header: String?) -> Int64 {
+        guard let header else { return 0 }
+        let spec = header.trimmingCharacters(in: .whitespaces)
+        guard spec.lowercased().hasPrefix("bytes=") else { return 0 }
+        let body = spec.dropFirst("bytes=".count)
+        guard let dash = body.firstIndex(of: "-") else { return 0 }
+        let left = body[body.startIndex..<dash].trimmingCharacters(in: .whitespaces)
+        guard !left.isEmpty else { return 0 }
+        return Int64(left) ?? 0
     }
 
     /// Валидный ли origin-URL. Только http(s); loopback запрещён (иначе прокси уходит в себя).

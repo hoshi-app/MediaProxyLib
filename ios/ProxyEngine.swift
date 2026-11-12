@@ -39,6 +39,10 @@ public final class ProxyEngine {
         var streamRefHeld = false
         var stale = false
         var authNotified = false
+        /// Per-session cookie jar: host → name → value (§6.1). Никакого HTTPCookieStorage.
+        var cookies: [String: [String: String]] = [:]
+        /// Один лок на изменяемое состояние сессии: запросы плейлиста/сегментов идут с разных потоков.
+        let lock = NSRecursiveLock()
 
         init(id: String, originUrl: String, cacheKey: String, headers: [String: String],
              cacheable: Bool, generation: Int, now: TimeInterval) {
@@ -58,12 +62,15 @@ public final class ProxyEngine {
         let text: String
         let result: RewriteResult
         let indexByUrl: [String: Int]
+        let fetchedAt: TimeInterval
 
-        init(originUrl: String, finalUrl: String, text: String, result: RewriteResult) {
+        init(originUrl: String, finalUrl: String, text: String, result: RewriteResult,
+             fetchedAt: TimeInterval = Date().timeIntervalSince1970) {
             self.originUrl = originUrl
             self.finalUrl = finalUrl
             self.text = text
             self.result = result
+            self.fetchedAt = fetchedAt
             var map: [String: Int] = [:]
             for segment in result.media.segments { map[segment.url] = segment.index }
             self.indexByUrl = map
@@ -94,7 +101,7 @@ public final class ProxyEngine {
         }
     }
 
-    private let queue = DispatchQueue(label: "tv.mediaproxy.engine")
+    private let queue = DispatchQueue(label: "tv.mediaproxy.playlist")
     private let downloadsLock = NSRecursiveLock()
     private let sessionsLock = NSRecursiveLock()
     private let configLock = NSLock()
@@ -106,8 +113,8 @@ public final class ProxyEngine {
     }
 
     private let root: URL
-    private var cache: CacheStore!
-    private var origin: OriginClient!
+    private var cache: CacheStore
+    private var origin: OriginClient
     private var server: HttpServer?
     private var running = false
     private var generation = 0
@@ -118,7 +125,6 @@ public final class ProxyEngine {
     private var hits = 0
     private var misses = 0
     private var prefetchedCount = 0
-    private var evictions = 0
 
     private let interactiveQueue: OperationQueue = {
         let q = OperationQueue()
@@ -139,6 +145,11 @@ public final class ProxyEngine {
 
     public init(root: URL) {
         self.root = root
+        // Кэш и клиент создаются в конструкторе, а не в start(): getStats()/getStreamState()
+        // вызываются из JS и до start(), и не должны падать на nil.
+        self.cache = CacheStore(root: root, config: { ProxyConfig() },
+                                diskFree: { Fs.freeDiskBytes(at: root) })
+        self.origin = OriginClient()
     }
 
     // MARK: - lifecycle
@@ -175,15 +186,17 @@ public final class ProxyEngine {
 
     public func stop() {
         sessionsLock.lock()
+        let all = Array(sessions.values)
         sessions.removeAll()
         sessionsLock.unlock()
+        for session in all { releaseSessionResources(session) }
         downloadsLock.lock()
         for (_, d) in downloads { d.cancelled = true }
         downloads.removeAll()
         downloadsLock.unlock()
         server?.stop()
         server = nil
-        origin?.shutdown()
+        origin.shutdown()
         running = false
     }
 
@@ -227,7 +240,7 @@ public final class ProxyEngine {
         evictOldSessionsLocked(now: now, keeping: sid)
         sessionsLock.unlock()
 
-        let kind: ResourceKind = PlaylistRewriter.isPlaylistCandidate(url: originUrl, contentType: nil) ? .playlist : .playlist
+        let kind: ResourceKind = .playlist
         let url = proxyUrl(session: session, absolute: originUrl, kind: kind, port: server.boundPort)
         Log.line("resolve", "sid=\(sid) cached=\(cacheable) \(originUrl)")
         if options.prewarm {
@@ -245,16 +258,27 @@ public final class ProxyEngine {
         let session = sessions.removeValue(forKey: streamId)
         sessionsLock.unlock()
         guard let session else { return }
-        if let stream = session.stream, session.streamRefHeld {
+        releaseSessionResources(session)
+    }
+
+    /// Освобождает всё, что сессия держала: ref кэша, свои загрузки, маркеры prefetch.
+    /// Без этого вытесненная сессия навсегда оставляла бы стрим с `refs > 0` (то есть неудаляемым).
+    private func releaseSessionResources(_ session: Session) {
+        session.lock.lock()
+        if session.streamRefHeld, let stream = session.stream {
             cache.release(stream)
         }
+        session.streamRefHeld = false
+        session.stream = nil
+        session.lock.unlock()
+
         downloadsLock.lock()
-        for (key, d) in downloads where d.session.id == streamId {
+        for (key, d) in downloads where d.session.id == session.id {
             d.cancelled = true
             downloads.removeValue(forKey: key)
         }
-        downloadsLock.unlock()
         prefetched = prefetched.filter { !$0.hasPrefix(session.cacheKey + "|") }
+        downloadsLock.unlock()
     }
 
     public func failOpen(_ streamIdOrUrl: String) -> [String: Any]? {
@@ -274,13 +298,13 @@ public final class ProxyEngine {
     }
 
     public func nudge(_ streamId: String) -> [String: Any] {
-        guard let session = sessionById(streamId), session.cacheable,
-              let media = session.activeMedia, let stream = session.stream else {
-            return ["queued": 0]
+        guard let session = sessionById(streamId), session.cacheable else { return ["queued": 0] }
+        return session.lock.withLock { () -> [String: Any] in
+            guard let media = session.activeMedia, let stream = session.stream else { return ["queued": 0] }
+            let from = max(0, session.lastSegmentIndex)
+            let queued = schedulePrefetch(session: session, stream: stream, resource: media, from: from)
+            return ["queued": queued]
         }
-        let from = max(0, session.lastSegmentIndex)
-        let queued = schedulePrefetch(session: session, stream: stream, resource: media, from: from)
-        return ["queued": queued]
     }
 
     // MARK: - HTTP routing
@@ -298,7 +322,8 @@ public final class ProxyEngine {
 
         if session.stale { return .text(410, "stale") }
 
-        if kind == .playlist || session.playlists[absolute] != nil {
+        let knownPlaylist = session.lock.withLock { session.playlists[absolute] != nil }
+        if kind == .playlist || knownPlaylist {
             return loadPlaylist(session: session, url: absolute)
         }
         if kind == .key {
@@ -308,13 +333,20 @@ public final class ProxyEngine {
     }
 
     private func loadPlaylist(session: Session, url: String) -> HttpReply {
-        if let cached = session.playlists[url] {
-            return playlistReply(cached, range: nil)
+        let cached = session.lock.withLock { session.playlists[url] }
+        if let cached {
+            // Кэшируемый VOD-плейлист неизменен, а live/event обязан перечитываться: иначе
+            // воспроизведение «замерзает» на первом же списке сегментов (§5.5).
+            let age = Date().timeIntervalSince1970 - cached.fetchedAt
+            if cached.result.cacheable || age < playlistTtl(resource: cached) {
+                return playlistReply(cached, range: nil)
+            }
         }
         let cfg = config
         let profile = TimeoutProfile.playlist(cfg)
-        let result = origin.fetchPlaylist(url: url, headers: session.headers, profile: profile,
-                                          maxBytes: cfg.maxPlaylistBytes)
+        let result = origin.fetchPlaylist(url: url, headers: headersFor(session: session, url: url),
+                                          profile: profile, maxBytes: cfg.maxPlaylistBytes)
+        mergeCookies(session: session, url: url, setCookies: result.cookies)
         if let error = result.error {
             notifyError(session: session, url: url, code: error, attempt: 1, originStatus: nil)
             return errorReply(error)
@@ -335,21 +367,32 @@ public final class ProxyEngine {
             return self.proxyUrl(session: session, absolute: absolute, kind: kind, port: server.boundPort)
         }
         let resource = PlaylistResource(originUrl: url, finalUrl: finalUrl, text: rewritten.text, result: rewritten)
-        session.playlists[url] = resource
-        session.playlists[finalUrl] = resource
 
-        if rewritten.kind == .media {
-            session.activeMedia = resource
-            if !rewritten.cacheable {
-                session.cacheable = false
-                Log.line("playlist", "без кэша: \(rewritten.reason) \(url)")
+        session.lock.withLock {
+            session.playlists[url] = resource
+            session.playlists[finalUrl] = resource
+            if rewritten.kind == .media {
+                session.activeMedia = resource
+                if !rewritten.cacheable {
+                    session.cacheable = false
+                    Log.line("playlist", "без кэша: \(rewritten.reason) \(url)")
+                }
+                ensureStreamLocked(session: session, fingerprint: rewritten.fingerprint)
             }
-            ensureStream(session: session, fingerprint: rewritten.fingerprint)
-            if cfg.prewarmSegments > 0 {
+        }
+        if rewritten.kind == .media {
+            // Прогрев только для кэшируемого VOD: у live/BYTERANGE/DRM первые «сегменты» —
+            // это либо пустая трата трафика, либо весь медиафайл целиком.
+            if cfg.prewarmSegments > 0, session.cacheable {
                 prewarm(session: session, resource: resource)
             }
         }
         return playlistReply(resource, range: nil)
+    }
+
+    /// Срок жизни не-cacheable плейлиста: один таргет-дирекшн, но не меньше 2 с.
+    private func playlistTtl(resource: PlaylistResource) -> TimeInterval {
+        max(resource.result.media.targetDuration, 2)
     }
 
     private func playlistReply(_ resource: PlaylistResource, range: String?) -> HttpReply {
@@ -360,85 +403,93 @@ public final class ProxyEngine {
 
     private func serveSegment(session: Session, url: String, range: String?) -> HttpReply {
         let cfg = config
-        guard session.cacheable, let media = session.activeMedia, let stream = session.stream else {
+        let snapshot = session.lock.withLock { (session.activeMedia, session.stream) }
+        guard session.cacheable, let media = snapshot.0, let stream = snapshot.1 else {
             return passThrough(session: session, url: url, range: range, cacheState: "passthrough")
         }
         guard let index = media.indexByUrl[url] else {
             return passThrough(session: session, url: url, range: range, cacheState: "passthrough")
         }
-        session.lastSegmentIndex = max(session.lastSegmentIndex, index)
+        session.lock.withLock { session.lastSegmentIndex = max(session.lastSegmentIndex, index) }
         let segment = media.result.media.segments.first(where: { $0.index == index })
 
-        if !cache.evictIfNeeded(required: 0, protecting: [session.cacheKey], now: Date().timeIntervalSince1970) {
-            return passThrough(session: session, url: url, range: range, cacheState: "passthrough")
-        }
-
         var entry = cache.ensureEntry(stream, index: index, now: Date().timeIntervalSince1970)
+        // Хит проверяется ДО эвикции: иначе на заполненном диске готовый сегмент уходил бы в сеть.
         if entry.complete {
             bumpHits()
             let type = entry.contentType ?? Http.contentType(forExtension: urlPathExtension(url))
-            return HttpReply(status: 200, headers: ["Content-Type": type, "Cache-Control": "no-store"],
-                             body: FileBody(url: entry.file), length: entry.prefix, cacheState: "hit")
+            return HttpReply(status: 200, headers: cacheHeaders(type: type, state: "hit"),
+                             body: FileBody(url: entry.file), length: entry.prefix)
         }
         if entry.failedUntil > Date().timeIntervalSince1970 {
             return errorReply(.budgetExhausted)
         }
+        if !cache.evictIfNeeded(required: 0, protecting: [session.cacheKey], now: Date().timeIntervalSince1970) {
+            return passThrough(session: session, url: url, range: range, cacheState: "passthrough")
+        }
         bumpMisses()
 
-        let feed = entry.feed ?? ensureDownload(session: session, stream: stream, index: index, segment: segment,
-                                                profile: .interactive(cfg))
-        entry = cache.ensureEntry(stream, index: index, now: Date().timeIntervalSince1970)
-        if let error = feed?.waitForFirstBytes(timeout: cfg.reqFirstByteSec) {
-            notifyError(session: session, url: url, code: error, attempt: 1, originStatus: nil)
+        guard let feed = ensureDownload(session: session, stream: stream, index: index, segment: segment,
+                                        profile: .interactive(cfg)) else {
+            return passThrough(session: session, url: url, range: range, cacheState: "passthrough")
+        }
+        if let error = feed.waitForMeta(timeout: cfg.reqFirstByteSec) {
+            // Событие отдаёт загрузчик (runDownload): иначе на один сбой приходило бы два onError.
             return errorReply(error)
         }
-        let total = feed?.total ?? -1
+        let total = feed.total
         if total <= 0 {
             return passThrough(session: session, url: url, range: range, cacheState: "passthrough")
         }
-        let type = feed?.responseType ?? entry.contentType ?? Http.contentType(forExtension: urlPathExtension(url))
+        let type = feed.responseType ?? entry.contentType ?? Http.contentType(forExtension: urlPathExtension(url))
         cache.update(stream, index: index) { $0.contentType = type }
         schedulePrefetch(session: session, stream: stream, resource: media, from: index)
-        return HttpReply(status: 200, headers: ["Content-Type": type, "Cache-Control": "no-store"],
-                         body: GrowingFileBody(url: entry.file, feed: feed!), length: total, cacheState: "miss")
+        entry = cache.ensureEntry(stream, index: index, now: Date().timeIntervalSince1970)
+        return HttpReply(status: 200, headers: cacheHeaders(type: type, state: "miss"),
+                         body: GrowingFileBody(url: entry.file, feed: feed), length: total)
+    }
+
+    /// Заголовки ответа. `X-MediaProxy-Cache` — только в debug (§4.2).
+    private func cacheHeaders(type: String, state: String) -> [String: String] {
+        var headers = ["Content-Type": type, "Cache-Control": "no-store"]
+        if config.debug { headers["X-MediaProxy-Cache"] = state }
+        return headers
     }
 
     private func passThrough(session: Session, url: String, range: String?, cacheState: String) -> HttpReply {
         let cfg = config
         let feed = ByteFeed(file: nil)
-        var start: Int64 = 0
-        var playerRange: String? = nil
-        if let range, range.lowercased().hasPrefix("bytes=") {
-            playerRange = range
-            if let parsed = Http.parseRange(range, total: Int64.max) { start = parsed.start }
-        }
+        let start = Http.rangeStart(range)
         let profile = TimeoutProfile.interactive(cfg)
-        origin.open(OriginClient.Request(url: url, headers: session.headers, rangeStart: start,
-                                         profile: profile, isPrefetch: false, expectPlaylist: false),
-                    feed: feed) { [weak self] _ in
-            self?.applyCookies(session: session, feed: feed, url: url)
+        origin.open(OriginClient.Request(url: url, headers: headersFor(session: session, url: url),
+                                         rangeStart: start, profile: profile, isPrefetch: false,
+                                         expectPlaylist: false),
+                    feed: feed) { [weak self] _, cookies in
+            self?.mergeCookies(session: session, url: url, setCookies: cookies)
         }
-        if let error = feed.waitForFirstBytes(timeout: cfg.reqFirstByteSec) {
+        if let error = feed.waitForMeta(timeout: cfg.reqFirstByteSec) {
             notifyError(session: session, url: url, code: error, attempt: 1, originStatus: nil)
             return errorReply(error)
         }
         let total = feed.total
         let type = feed.responseType ?? Http.contentType(forExtension: urlPathExtension(url))
+        var headers = cacheHeaders(type: type, state: cacheState)
         if total < 0 {
-            return HttpReply(status: 200, headers: ["Content-Type": type, "Cache-Control": "no-store"],
-                             body: StreamBody(feed: feed), length: -1, cacheState: cacheState)
-        }
-        var headers: [String: String] = ["Content-Type": type, "Cache-Control": "no-store"]
-        if start > 0 {
-            headers["Content-Range"] = "bytes \(start)-\(start + total - 1)/\(start + total)"
-            var reply = HttpReply(status: 206, headers: headers, body: StreamBody(feed: feed),
-                                  length: total - start, cacheState: cacheState)
+            var reply = HttpReply(status: 200, headers: headers, body: StreamBody(feed: feed), length: -1)
             reply.rangeHandled = true
             return reply
         }
-        var reply = HttpReply(status: 200, headers: headers, body: StreamBody(feed: feed),
-                              length: total, cacheState: cacheState)
-        reply.rangeHandled = playerRange != nil
+        if start > 0 {
+            // `total` — полный размер ресурса, поэтому Content-Range от `start` до `total-1`,
+            // а длина тела — хвост. Раньше считалось `start + total`, и заголовок уезжал.
+            headers["Content-Range"] = "bytes \(start)-\(total - 1)/\(total)"
+            var reply = HttpReply(status: 206, headers: headers, body: StreamBody(feed: feed),
+                                  length: total - start)
+            reply.rangeHandled = true
+            return reply
+        }
+        var reply = HttpReply(status: 200, headers: headers, body: StreamBody(feed: feed), length: total)
+        reply.rangeHandled = true
         return reply
     }
 
@@ -462,7 +513,7 @@ public final class ProxyEngine {
             downloadsLock.unlock()
             return nil
         }
-        let feed = ByteFeed(file: cache.fileURL(stream, index))
+        let feed = openFeed(stream, index)
         let download = Download(key: key, session: session, stream: stream, segment: segment,
                                 feed: feed, isPrefetch: false)
         downloads[key] = download
@@ -471,98 +522,131 @@ public final class ProxyEngine {
         cache.ensureEntry(stream, index: index, now: Date().timeIntervalSince1970)
         cache.update(stream, index: index) { entry in
             entry.downloading = true
-            entry.total = -1
-            entry.prefix = 0
+            entry.prefix = feed.written
             entry.complete = false
             entry.failedUntil = 0
         }
-        queue.async { [weak self] in
+        // Загрузки идут параллельно (OperationQueue), а не на одной последовательной очереди:
+        // иначе один висящий origin блокировал бы все остальные сегменты.
+        interactiveQueue.addOperation { [weak self] in
             self?.runDownload(download, profile: profile)
         }
         return feed
     }
 
+    /// Feed с докачкой: если на диске уже лежит префикс, он не затирается, а продолжается.
+    private func openFeed(_ stream: CacheStore.Stream, _ index: Int) -> ByteFeed {
+        let file = cache.fileURL(stream, index)
+        return ByteFeed(file: file, resumeFrom: Fs.size(file))
+    }
+
     private func runDownload(_ download: Download, profile: TimeoutProfile) {
         let cfg = config
+        let index = download.segment?.index ?? 0
         var attempt = 0
-        while !download.cancelled {
-            let start = download.feed.written
-            let index = download.segment?.index ?? 0
-            let semaphore = DispatchSemaphore(value: 0)
-            var terminal: ProxyErrorCode? = nil
-
-            origin.open(OriginClient.Request(url: download.segment?.url ?? sessionOrigin(download),
-                                             headers: download.session.headers,
-                                             rangeStart: start,
-                                             ifRange: nil,
-                                             profile: profile,
-                                             isPrefetch: false,
-                                             expectPlaylist: false),
-                        feed: download.feed) { error in
-                terminal = error
-                semaphore.signal()
+        do {
+            // Файл уже содержит весь сегмент, но запись не закоммичена: докачивать нечего,
+            // иначе Range за пределом ресурса даст 416.
+            let knownTotal = cache.entry(download.stream, index: index)?.total ?? -1
+            if download.feed.written > 0, knownTotal > 0, download.feed.written >= knownTotal {
+                download.feed.finish()
+                cache.update(download.stream, index: index) { e in
+                    e.total = knownTotal
+                    e.prefix = knownTotal
+                    e.complete = true
+                    e.downloading = false
+                }
+                if download.isPrefetch { bumpPrefetched() }
+                return
             }
-            if download.session.stale {
-                download.feed.fail(.networkChanged)
-            }
-            _ = semaphore.wait(timeout: .now() + 300)
+            while !download.cancelled {
+                let start = download.feed.written
+                let ifRange = start > 0 ? (download.feed.etagValue ?? cache.entry(download.stream, index: index)?.etag) : nil
+                let semaphore = DispatchSemaphore(value: 0)
+                var terminal: ProxyErrorCode? = nil
+                var receivedCookies: [String] = []
 
-            if terminal == nil {
-                let total = download.feed.total
+                origin.open(OriginClient.Request(url: download.segment?.url ?? sessionOrigin(download),
+                                                 headers: headersFor(session: download.session,
+                                                                     url: download.segment?.url ?? download.session.originUrl),
+                                                 rangeStart: start,
+                                                 ifRange: ifRange,
+                                                 profile: profile,
+                                                 isPrefetch: download.isPrefetch,
+                                                 expectPlaylist: false),
+                            feed: download.feed) { error, cookies in
+                    terminal = error
+                    receivedCookies = cookies
+                    semaphore.signal()
+                }
+                _ = semaphore.wait(timeout: .now() + 300)
+                mergeCookies(session: download.session,
+                             url: download.segment?.url ?? download.session.originUrl,
+                             setCookies: receivedCookies)
+
+                if terminal == nil {
+                    let total = download.feed.total
+                    let written = download.feed.written
+                    cache.ensureEntry(download.stream, index: index, now: Date().timeIntervalSince1970)
+                    cache.update(download.stream, index: index) { e in
+                        e.total = total
+                        e.prefix = written
+                        e.complete = total >= 0 && written == total
+                        e.downloading = false
+                        e.feed = download.feed
+                        e.contentType = download.feed.responseType
+                        e.etag = download.feed.etagValue
+                        e.lastAccess = Date().timeIntervalSince1970
+                    }
+                    finishDownload(download, error: nil)
+                    return
+                }
+
+                let code = terminal ?? .connectFailed
+                if code == .rangeUnsupported, start > 0 {
+                    // Префикс не подходит к текущему ресурсу: начинаем сегмент заново, иначе
+                    // отдадим склейку из двух разных файлов.
+                    if let file = download.feed.file { Fs.truncate(file, to: 0) }
+                    download.feed.fail(code)
+                    cache.ensureEntry(download.stream, index: index, now: Date().timeIntervalSince1970)
+                    cache.update(download.stream, index: index) { e in
+                        e.total = -1; e.prefix = 0; e.complete = false; e.downloading = false; e.etag = nil
+                    }
+                    notifyError(session: download.session, url: download.segment?.url ?? "", code: code,
+                                attempt: attempt + 1, originStatus: nil)
+                    finishDownload(download, error: code)
+                    return
+                }
+
+                attempt += 1
+                // Ретраит плеер, а не мы: нативные повторы только для prefetch и продолжений.
+                let mayRetry = download.isPrefetch || start > 0 || download.feed.written > start
+                if code.isRetryable && mayRetry && attempt <= cfg.prefetchRetries && !download.cancelled {
+                    let backoff = cfg.retryBackoffMs[min(attempt - 1, cfg.retryBackoffMs.count - 1)]
+                    Thread.sleep(forTimeInterval: Double(backoff) / 1000)
+                    continue
+                }
+
                 let written = download.feed.written
-                cache.ensureEntry(download.stream, index: download.segment?.index ?? 0, now: Date().timeIntervalSince1970)
-                cache.update(download.stream, index: download.segment?.index ?? 0) { e in
+                let total = download.feed.total
+                download.feed.fail(code)
+                cache.ensureEntry(download.stream, index: index, now: Date().timeIntervalSince1970)
+                cache.update(download.stream, index: index) { e in
                     e.total = total
                     e.prefix = written
                     e.complete = total >= 0 && written == total
                     e.downloading = false
+                    e.failedUntil = Date().timeIntervalSince1970 + cfg.cooldownSec
                     e.feed = download.feed
-                    e.lastAccess = Date().timeIntervalSince1970
+                    e.etag = download.feed.etagValue
                 }
-                finishDownload(download, error: nil)
+                notifyError(session: download.session, url: download.segment?.url ?? "", code: code,
+                            attempt: attempt, originStatus: nil)
+                finishDownload(download, error: code)
                 return
             }
-
-            let code = terminal ?? .connectFailed
-            if code == .rangeUnsupported, start > 0 {
-                // origin проигнорировал Range: начинаем сегмент заново.
-                let fresh = ByteFeed(file: cache.fileURL(download.stream, download.segment?.index ?? 0))
-                // проще: пометить failed и позволить плееру перезапросить
-                cache.ensureEntry(download.stream, index: download.segment?.index ?? 0, now: Date().timeIntervalSince1970)
-                cache.update(download.stream, index: download.segment?.index ?? 0) { e in
-                    e.prefix = 0; e.total = -1; e.downloading = false; e.failedUntil = 0
-                }
-                _ = fresh
-                finishDownload(download, error: .rangeUnsupported)
-                return
-            }
-
-            attempt += 1
-            let retryable = code.isRetryable || (download.feed.written > 0 && code == .truncated)
-            if retryable && attempt <= cfg.prefetchRetries && !download.cancelled {
-                let backoff = cfg.retryBackoffMs[min(attempt - 1, cfg.retryBackoffMs.count - 1)]
-                Thread.sleep(forTimeInterval: Double(backoff) / 1000)
-                continue
-            }
-
-            let written = download.feed.written
-            let total = download.feed.total
-            download.feed.fail(code)
-            cache.ensureEntry(download.stream, index: download.segment?.index ?? 0, now: Date().timeIntervalSince1970)
-            cache.update(download.stream, index: download.segment?.index ?? 0) { e in
-                e.total = total
-                e.prefix = written
-                e.complete = total >= 0 && written == total
-                e.downloading = false
-                e.failedUntil = Date().timeIntervalSince1970 + cfg.cooldownSec
-                e.feed = download.feed
-            }
-            notifyError(session: download.session, url: download.segment?.url ?? "", code: code,
-                        attempt: attempt, originStatus: nil)
-            finishDownload(download, error: code)
-            return
+            finishDownload(download, error: .networkChanged)
         }
-        finishDownload(download, error: .networkChanged)
     }
 
     private func finishDownload(_ download: Download, error: ProxyErrorCode?) {
@@ -578,7 +662,8 @@ public final class ProxyEngine {
     }
 
     private func prewarm(session: Session, resource: PlaylistResource) {
-        guard session.cacheable, let stream = session.stream else { return }
+        let stream = session.lock.withLock { session.cacheable ? session.stream : nil }
+        guard let stream else { return }
         let count = min(max(0, config.prewarmSegments), resource.result.media.segments.count)
         for segment in resource.result.media.segments.prefix(count) {
             enqueuePrefetch(session: session, stream: stream, segment: segment)
@@ -607,9 +692,16 @@ public final class ProxyEngine {
 
     @discardableResult
     private func enqueuePrefetch(session: Session, stream: CacheStore.Stream, segment: PlaylistSegment) -> Bool {
+        guard session.cacheable else { return false }
         let key = "\(stream.key)#\(segment.index)"
         downloadsLock.lock()
         if downloads[key] != nil || prefetched.contains("\(session.cacheKey)|\(segment.index)") {
+            downloadsLock.unlock()
+            return false
+        }
+        let existing = cache.entry(stream, index: segment.index)
+        // Уже скачано или недавно провалилось — новый запрос только тратит трафик.
+        if existing?.complete == true || (existing?.failedUntil ?? 0) > Date().timeIntervalSince1970 {
             downloadsLock.unlock()
             return false
         }
@@ -618,7 +710,7 @@ public final class ProxyEngine {
             downloadsLock.unlock()
             return false
         }
-        let feed = ByteFeed(file: cache.fileURL(stream, segment.index))
+        let feed = openFeed(stream, segment.index)
         let download = Download(key: key, session: session, stream: stream, segment: segment,
                                 feed: feed, isPrefetch: true)
         downloads[key] = download
@@ -632,8 +724,7 @@ public final class ProxyEngine {
             self.cache.ensureEntry(stream, index: segment.index, now: Date().timeIntervalSince1970)
             self.cache.update(stream, index: segment.index) { entry in
                 entry.downloading = true
-                entry.total = -1
-                entry.prefix = 0
+                entry.prefix = feed.written
                 entry.complete = false
                 entry.failedUntil = 0
             }
@@ -642,7 +733,8 @@ public final class ProxyEngine {
         return true
     }
 
-    private func ensureStream(session: Session, fingerprint: String) {
+    /// Вызывать, держа `session.lock`.
+    private func ensureStreamLocked(session: Session, fingerprint: String) {
         let stream = cache.openStream(cacheKey: session.cacheKey, fingerprint: fingerprint,
                                       now: Date().timeIntervalSince1970)
         if session.stream !== stream {
@@ -656,7 +748,6 @@ public final class ProxyEngine {
     // MARK: - state / stats
 
     public func stats() -> [String: Any] {
-        let now = Date().timeIntervalSince1970
         let total = cache.totalBytes()
         let cfg = config
         return [
@@ -666,21 +757,21 @@ public final class ProxyEngine {
             "streams": sessionsLock.withLock { sessions.count },
             "hits": countersLock.withLock { hits },
             "misses": countersLock.withLock { misses },
-            "evictions": countersLock.withLock { evictions },
+            "evictions": cache.evictedCount(),
             "prefetched": countersLock.withLock { prefetchedCount },
             "maxSessions": cfg.maxSessions,
-            "now": now,
         ]
     }
 
     public func streamState(_ streamId: String) -> [String: Any] {
         guard let session = sessionById(streamId) else { return ["cacheKey": "", "cacheable": false, "segments": [], "cachedAheadSec": 0] }
-        guard let media = session.activeMedia, let stream = session.stream else {
+        let snapshot = session.lock.withLock { (session.activeMedia, session.stream, session.lastSegmentIndex) }
+        guard let media = snapshot.0, let stream = snapshot.1 else {
             return ["cacheKey": session.cacheKey, "cacheable": session.cacheable, "segments": [], "cachedAheadSec": 0]
         }
         var segments: [[String: Any]] = []
         var cachedAhead = 0.0
-        let last = max(0, session.lastSegmentIndex)
+        let last = max(0, snapshot.2)
         for segment in media.result.media.segments {
             let entry = cache.entry(stream, index: segment.index)
             let complete = entry?.complete ?? false
@@ -698,9 +789,15 @@ public final class ProxyEngine {
     }
 
     public func clearCache(_ streamId: String? = nil) -> [String: Any] {
-        var cacheKey: String? = nil
-        if let streamId { cacheKey = sessionById(streamId)?.cacheKey }
-        let freed = cache.clear(cacheKey: cacheKey)
+        // Без streamId — чистим всё. С streamId неизвестной сессии — ничего: иначе clearCache
+        // по уже освобождённому id молча стирал бы весь кэш приложения.
+        let freed: Int64
+        if let streamId {
+            guard let session = sessionById(streamId) else { return ["freedBytes": 0] }
+            freed = cache.clear(cacheKey: session.cacheKey)
+        } else {
+            freed = cache.clear(cacheKey: nil)
+        }
         emit("onCache", ["type": "clear", "bytes": cache.totalBytes(),
                          "maxBytes": config.maxCacheBytes])
         return ["freedBytes": freed]
@@ -727,12 +824,16 @@ public final class ProxyEngine {
 
     private func evictOldSessionsLocked(now: TimeInterval, keeping: String) {
         let maxSessions = config.maxSessions
+        var victims: [Session] = []
         while sessions.count > maxSessions {
             // Вытесняем только ДРУГИЕ сессии: при равных timestamp могли выбросить новую.
             guard let victim = sessions.values.filter({ $0.id != keeping })
                 .min(by: { $0.lastAccess < $1.lastAccess }) else { break }
             sessions.removeValue(forKey: victim.id)
+            victims.append(victim)
         }
+        // Освобождать ресурсы — ВНЕ замка сессий: releaseSessionResources берёт другие локи.
+        for victim in victims { releaseSessionResources(victim) }
     }
 
     private func sessionOrigin(_ download: Download) -> String {
@@ -749,27 +850,72 @@ public final class ProxyEngine {
 
     private func notifyError(session: Session, url: String, code: ProxyErrorCode, attempt: Int,
                              originStatus: Int?) {
-        if code.isAuth, !session.authNotified {
-            session.authNotified = true
-            emit("onAuthRequired", ["streamId": session.id, "url": url,
-                                    "originStatus": originStatus ?? code.httpStatus])
+        if code.isAuth {
+            if !session.authNotified {
+                session.authNotified = true
+                emit("onAuthRequired", ["streamId": session.id, "url": url,
+                                        "originStatus": originStatus ?? originStatusCode(code)])
+            }
             return
         }
         emit("onError", [
             "code": code.rawValue, "streamId": session.id, "url": url,
-            "originStatus": originStatus ?? 0, "attempt": attempt,
+            "originStatus": originStatus ?? originStatusCode(code), "attempt": attempt,
             "retryable": code.isRetryable, "fatal": !code.isRetryable,
             "message": code.rawValue,
         ])
+    }
+
+    /// Код origin, а не наш HTTP-ответ плееру: `onAuthRequired.originStatus` должен быть 403/401/400/410.
+    private func originStatusCode(_ code: ProxyErrorCode) -> Int {
+        switch code {
+        case .origin400: return 400
+        case .origin401: return 401
+        case .origin403: return 403
+        case .origin404: return 404
+        case .origin410: return 410
+        case .origin429: return 429
+        case .origin5xx: return 500
+        default: return 0
+        }
     }
 
     private func emit(_ name: String, _ payload: [String: Any]) {
         onEvent?(name, payload)
     }
 
-    private func applyCookies(session: Session, feed: ByteFeed, url: String) {
-        // Cookie jar ведёт URLSession-Delegate в OriginClient для плейлистов/сегментов;
-        // здесь оставлено место для явного Cookie-заголовка из сессии (§6.1).
+    /// Заголовки origin-запроса: заголовки сессии + cookie из per-session jar по хосту (§6.1).
+    private func headersFor(session: Session, url: String) -> [String: String] {
+        guard let host = URL(string: url)?.host?.lowercased() else { return session.headers }
+        return session.lock.withLock { () -> [String: String] in
+            guard let jar = session.cookies[host], !jar.isEmpty else { return session.headers }
+            let cookie = jar.sorted(by: { $0.key < $1.key })
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: "; ")
+            var result = session.headers
+            if let existing = result.first(where: { $0.key.lowercased() == "cookie" })?.value, !existing.isEmpty {
+                result["Cookie"] = existing + "; " + cookie
+            } else {
+                result["Cookie"] = cookie
+            }
+            return result
+        }
+    }
+
+    private func mergeCookies(session: Session, url: String, setCookies: [String]) {
+        guard !setCookies.isEmpty, let host = URL(string: url)?.host?.lowercased() else { return }
+        session.lock.withLock {
+            var jar = session.cookies[host] ?? [:]
+            for raw in setCookies {
+                let pair = raw.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+                    .first.map { String($0) } ?? raw
+                guard let eq = pair.firstIndex(of: "=") else { continue }
+                let name = pair[..<eq].trimmingCharacters(in: .whitespaces)
+                let value = pair[pair.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+                if !name.isEmpty { jar[name] = value }
+            }
+            session.cookies[host] = jar
+        }
     }
 }
 
