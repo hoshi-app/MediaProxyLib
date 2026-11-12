@@ -29,6 +29,11 @@ http://127.0.0.1:<port>/s/<sid>/<b64url(origin-absolute-url)>/<name>.<ext>
 | неизвестная длина | 200, без `Content-Length`, `Connection: close` (close-delimited) |
 | ошибка origin | 502/504/503 по таблице плана §4.2 (никогда не 4xx) |
 
+Если запрос пришёл в absolute-form (`GET http://127.0.0.1:port/s/... HTTP/1.1`, RFC 7230 §5.3.2),
+путь нормализуется, а не превращается в 404.
+
+`X-MediaProxy-Cache: hit|miss|partial|passthrough` — заголовок отдаётся **только при `debug: true`**.
+
 Обязательные заголовки ответа: `Content-Type` (по расширению/оригиналу), `Content-Length` (если
 известна), `Accept-Ranges`, `Cache-Control: no-store` для плейлистов/ключей, `Connection`
 (`keep-alive` по умолчанию, `close` для close-delimited).
@@ -37,45 +42,59 @@ http://127.0.0.1:<port>/s/<sid>/<b64url(origin-absolute-url)>/<name>.<ext>
 
 ## 3. Идентичность и кэш
 
-- `cacheKey` приходит из JS и стабилен для (тайтл, серия, озвучка, качество).
+- `cacheKey` приходит из JS и стабилен для (тайтл, серия, озвучка, качество). Внимание: `cacheKey`
+  **содержит `|`** (`t1|p-x|e2|q720`), поэтому в журнале он всегда идёт **последним** полем.
 - Каталог: `<Caches>/mediaproxy/v1/<fnv1a64(cacheKey)>/`.
 - Отпечаток плейлиста: `fnv1a64("n=<segments>|td=<target>|f=<path первого>|l=<path последнего>|d=<сумма
   длительностей>|v=<вариантов>|map=<путь init>")`.
 - Журнал `journal.log`, append-only:
-  - `H|1|<cacheKey>|<fingerprint>`
-  - `S|<index>|<total>|<prefix>|<complete 0|1>|<contentType>|<accessedAt>|<index>`
-- При открытии стрима: шапка несовпала по отпечатку → каталог удаляется; файл `s%05d.bin`:
+  - `H|2|<fingerprint>|<cacheKey>` (порядок именно такой: отпечаток перед ключом, иначе ключ с `|`
+    не разобрать)
+  - `S|<index>|<total>|<prefix>|<complete 0|1>|<contentType>|<accessedAt мс>|<index>`
+- При открытии стрима **шапка сверяется с переданным отпечатком**: несовпадение (или отсутствие
+  `H|2`) → каталог полностью удаляется. Это единственная защита от отдачи сегментов чужого
+  плейлиста после рестарта процесса при совпавшем `cacheKey`. Файл `s%05d.bin`:
   - нет файла → запись удаляется;
   - `size < prefix` → `prefix = size`;
   - `size > prefix` → `truncate(prefix)`;
   - `complete && prefix != total` → `complete = false`;
   - `.bin` без записи → удалить; журнал переписывается (компакция).
 - Вытеснение: только целыми стримами, LRU по `lastAccess`; защищённые (`refs > 0`, активный
-  `cacheKey`, карантин) не трогаем; soft limit 90 % — стоп prefetch, hard 100 % — стоп новым записям.
+  `cacheKey`) не трогаем; soft limit 90 % — стоп prefetch, hard 100 % — стоп новым записям.
+- `clearCache()` без аргумента чистит всё; `clearCache(streamId)` чистит **только** кэш этой сессии,
+  а для неизвестного/освобождённого `streamId` возвращает `freedBytes: 0` и не трогает ничего.
 
 ## 4. Загрузка сегмента
 
 1. Ключ `(cacheKey, segmentIndex)`; single-flight на ключ.
-2. `feed.written == 0` → `Range` не шлём; `written > 0` → `Range: bytes=<written>-` + `If-Range`.
+2. `feed.written == 0` → `Range` не шлём; `written > 0` → `Range: bytes=<written>-` + `If-Range: <ETag>`.
+   Префикс, оставшийся на диске от прошлого запроса, **никогда не затирается**: новый `ByteFeed`
+   открывается на дозапись с `written = размер файла` (докачка между запросами плеера, §2.4 п.9).
 3. `Accept-Encoding: identity`; прочие заголовки — только из сессии (hop-by-hop и `Range` — свои).
 4. Валидация ответа:
    - 200/206; `200` при запрошенном `Range>0` → ошибка `RANGE_UNSUPPORTED` (движок решает: сброс/повтор);
-   - `text/html` → `HTML_RESPONSE`, не кэшировать;
-   - `Content-Range` для 206 обязателен, `total` = значение после `/`;
-   - `Content-Length` и фактический объём в конце: не совпало → `TRUNCATED`.
+   - `416` на наш `Range` → `RANGE_UNSUPPORTED` (префикс не подходит к ресурсу);
+   - `text/html` → `HTML_RESPONSE`, не кэшировать (и для плейлистов, и для сегментов);
+   - `Content-Range` для 206 обязателен, `total` = значение после `/`, `start` должен совпасть с
+     запрошенным, иначе `RANGE_UNSUPPORTED`;
+   - ожидаемый объём = `baseline + (total - rangeStart)`: для 206 `total` — размер **всего** ресурса,
+     поэтому сравнение «written == total» верно только при `rangeStart == 0`;
+   - не совпало → `TRUNCATED`.
 5. Тело пишется в файл; `feed.written` растёт; читатели ждут на condition (не EOF).
 6. Терминальные состояния: `complete` (written == total), `failed` (код + `failedUntil`), `truncated`
-   (ретрай с `Range`), `rangeUnsupported` (сброс записи).
-7. Ретраи: только prefetch и продолжение с ненулевым префиксом; 3 попытки, паузы 0.5/1.5/4 с,
-   cooldown 30 с на сегмент.
+   (ретрай с `Range`), `rangeUnsupported` (файл усечён до 0, запись сброшена, событие один раз).
+7. Ретраи: **только** prefetch и продолжения, где байты уже шли; 3 попытки, паузы 0.5/1.5/4 с,
+   cooldown 30 с на сегмент. Запрос самого плеера без первого байта не ретраится нативно —
+   он получает 502/504, а префикс остаётся на диске для его же повторного `Range`.
+8. `onError` — один раз на переход в `failed`, отдаёт его загрузчик (не обработчик запроса).
 
 ## 5. Заголовки сессии
 
 - Источник — `resolve().headers`, больше ниоткуда.
 - Снимаем: `Host`, `Connection`, `Content-Length`, `Range`, `Accept-Encoding`; ставим
   `Accept-Encoding: identity`.
-- `Cookie`: явный заголовок сессии + per-session jar из `Set-Cookie` (iOS
-  `httpShouldSetCookies=false`, `httpCookieStorage=nil`).
+- `Cookie`: явный заголовок сессии + per-session jar из `Set-Cookie` (обе платформы; iOS —
+  `httpShouldSetCookies=false`, `httpCookieStorage=nil`, jar ведёт движок).
 - `Origin` не добавляем, `User-Agent` не подменяем.
 
 ## 6. Коды ошибок
@@ -89,6 +108,17 @@ http://127.0.0.1:<port>/s/<sid>/<b64url(origin-absolute-url)>/<name>.<ext>
 
 - `resolve` синхронный, никогда не бросает; при недоступном сервере возвращает
   `{url: origin, cached: false, reason: "NOT_STARTED"}`.
-- Активных сессий ≤ `maxSessions` (LRU по `lastAccess`).
+- `cached` = «прокси пригоден и кэш на диске включён для этой сессии» (`options.cache && enabled`),
+  а **не** «сегменты уже в кэше». Проверять наличие прогретого нужно через `getStreamState`.
+  Приложение по контракту fail-open: `url === origin` (или `streamId === ""`) означает «играй origin».
+- Активных сессий ≤ `maxSessions` (LRU по `lastAccess`). Вытесненная сессия освобождает ref кэша,
+  отменяет свои загрузки и снимает свои prefetch-маркеры — иначе стрим навсегда остаётся неудаляемым.
 - `release` отменяет prefetch этой сессии, снимает refcount, но не удаляет кэш.
 - `failOpen` помечает сессию `stale`: новые запросы её URL → 410, JS монтирует origin напрямую.
+
+## 8. Плейлисты
+
+- Кэшируемый VOD (`ENDLIST`, без BYTERANGE/LL-HLS/DRM) держится в памяти сессии бессрочно.
+- Не-cacheable плейлист (live/event) перечитывается из origin по TTL = `max(TARGETDURATION, 2 с)`,
+  иначе после первого списка сегментов воспроизведение «замерзает».
+- Преварм (`prewarmSegments`) выполняется **только** для кэшируемого VOD.

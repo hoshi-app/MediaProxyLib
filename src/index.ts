@@ -154,14 +154,15 @@ export async function start(): Promise<StartResult> {
  */
 export function resolve(origin: string, options: ResolveOptions = {}): ResolveResult {
   const native = loadNative();
-  if (!native) return fallbackResolve(origin, 'NO_NATIVE');
-  if (!origin.startsWith('http://') && !origin.startsWith('https://')) {
-    return fallbackResolve(origin, 'INVALID_URL');
-  }
   try {
+    if (typeof origin !== 'string') return fallbackResolve('', 'INVALID_URL');
+    if (!native) return fallbackResolve(origin, 'NO_NATIVE');
+    if (!origin.startsWith('http://') && !origin.startsWith('https://')) {
+      return fallbackResolve(origin, 'INVALID_URL');
+    }
     return normalizeResolve(native.resolve(origin, options), origin);
   } catch {
-    return fallbackResolve(origin, 'RESOLVE_FAILED');
+    return fallbackResolve(typeof origin === 'string' ? origin : '', 'RESOLVE_FAILED');
   }
 }
 
