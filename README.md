@@ -1,93 +1,290 @@
+<div align="center">
+
 # MediaProxyLib
 
-Лёгкий HLS-прокси для React Native (iOS + Android): локальный HTTP-сервер, перезапись плейлистов,
-дисковый кэш сегментов с Range, prefetch, ретраи и события в JS.
+Локальный HTTP-прокси с дисковым кэшем для HLS в React Native (iOS + Android).
 
-План и все решения — в [docs/PLAN.md](docs/PLAN.md), общий контракт Swift/Kotlin/TS —
-[docs/PROTOCOL.md](docs/PROTOCOL.md).
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform: iOS / Android](https://img.shields.io/badge/platform-iOS%20%7C%20Android-lightgrey.svg)](#совместимость)
+[![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#статус)
 
-## Статус
+</div>
 
-| Часть | Состояние |
-|---|---|
-| План | утверждён, `docs/PLAN.md` |
-| Протокол | `docs/PROTOCOL.md` — общий контракт Swift/Kotlin/TS (обновлён после ревью) |
-| Kotlin-ядро (`android/`) | собирается и проверено локально: **281 проверка зелёная** |
-| Swift-ядро (`ios/`) | написано; **сборка на macOS не прогонялась** — считается непроверенным |
-| TS-оболочка (`src/`, `app.plugin.js`) | typecheck зелёный |
-| Android-библиотека (AGP/Expo) | не собиралась: нужен host-проект Expo и Maven |
+---
 
-> **Что было исправлено после адверсариального ревью (P0).** Докачка сегмента между запросами
-> плеера (префикс на диске больше не затирается), корректный `Content-Range` в pass-through,
-> сверка отпечатка плейлиста в журнале при старте, `clearCache(неизвестный id)` больше не чистит
-> весь кэш, преварм только для кэшируемого VOD, TTL для live-плейлистов, нативные ретраи только для
-> prefetch/продолжений, один `onError` на сбой, `evictions` считается, пул загрузок iOS больше не
-> последовательный, iOS: cookie-jar, `onAuthRequired.originStatus`, отсутствие крашей на nil,
-> config plugin ставит Android network-security-config для 127.0.0.1. Остались пункты P1/P2 из
-> плана ревью (метрики `onCache`, §6.5 смена сети, `serving`/буфер, CI и Gradle-тесты).
+## Назначение
 
-## Сборка и проверка без сети
+Библиотека поднимает в процессе приложения HTTP-сервер на `127.0.0.1` и ставит его
+между плеером и источником видео. Плеер получает loopback-URL вместо ссылки на CDN.
 
-Maven в этой среде недоступен, поэтому ядро и тесты идут кэшированным Kotlin-компилятором
-(нужны JDK 17 и прогретый `~/.gradle/caches`; версии jar зафиксированы в `tools/build-core.ps1`):
+Причина: нативные плееры (AVPlayer, ExoPlayer) не позволяют задать заголовки для
+запросов сегментов и не дают управлять дисковым кэшем. Прокси решает обе задачи
+одинаково на обеих платформах.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-core.ps1
+Термины: **плейлист** — список сегментов, **сегмент** — фрагмент видеофайла
+(несколько секунд), **loopback-URL** — адрес вида `http://127.0.0.1:<порт>/...`.
+
+## Возможности
+
+- **Заголовки сессии** (`User-Agent`, `Referer`, `Cookie`) передаются на плейлисты,
+  сегменты и ключи. Cookie из `Set-Cookie` сохраняются в cookie jar сессии.
+- **Дисковый кэш**: лимит в мегабайтах, автоматическое вытеснение, ручная очистка,
+  статистика. Данные переживают перезапуск приложения.
+- **Догрузка с префикса**: после обрыва загрузка продолжается с последнего
+  записанного байта, а не с начала.
+- **Предзагрузка**: 30 секунд вперёд, не более 6 сегментов, 2 параллельно.
+- **Восстановление**: при отсутствии прироста байтов движок перечитывает плейлист и
+  возобновляет загрузку по новым URL. Перемонтирование плеера не требуется.
+- **События**: ошибки, отказ авторизации, состояние сервера, состояние кэша,
+  автовосстановление.
+- **Ключи AES-128** не записываются на диск — только в памяти сессии.
+
+## Ограничения
+
+- DRM (FairPlay, Widevine) не поддерживается.
+- Live и LL-HLS проксируются без кэширования.
+- AirPlay с loopback-URL не работает.
+- ABR (выбор качества) не реализован: прокси отдаёт то, что запросил плеер.
+- Собственного foreground-сервиса на Android нет: фон обеспечивает сервис плеера.
+
+## Как это работает
+
+1. `start()` поднимает HTTP-сервер на `127.0.0.1` (эфемерный порт, на время процесса).
+2. `resolve(url, options)` создаёт сессию с заголовками и возвращает loopback-URL с
+   идентификатором сессии.
+3. Плеер запрашивает по этому URL плейлисты и сегменты.
+4. Прокси загружает плейлист, переписывает ссылки на loopback-адреса и кэширует
+   сегменты на диск.
+5. Частичные запросы (перемотка) отдаются из записанного префикса, остаток
+   догружается.
+6. Повторный просмотр и следующий запуск приложения читают данные с диска.
+
+```text
+AVPlayer / ExoPlayer  →  http://127.0.0.1:<port>/s/<sid>/<b64>/<name>.<ext>  →  прокси  →  CDN
+                                                                                   ↓
+                                                                              диск (кэш)
 ```
 
-Скрипт компилирует `android/src/main/java/tv/mediaproxy/core`, затем тесты и запускает
-`tv.mediaproxy.core.SelfTestKt` (assert-раннер, exit code 1 при провале). Покрыто: Range/206/416,
-перезапись HLS (master/media, MAP/KEY/MEDIA, AES-128, BYTERANGE, live, LL-HLS), журнал и реконсиляция
-кэша, эвикция, HTTP-сервер (keep-alive, HEAD, потоки, 8 параллельных), origin-клиент (206-докачка,
-HTML, 403/5xx, обрыв, тишина, пол скорости), сквозной прокси (заголовки, кэш-хит, перерезолв с новым
-токеном, префетч, clearCache, restart, fail-open, авторизация, cooldown).
+Если прокси недоступен, `resolve()` возвращает исходный URL с `cached: false` —
+приложение продолжает воспроизведение напрямую с CDN. Это поведение зафиксировано
+контрактом и не требует обработки исключений.
 
-TypeScript:
+## Установка
 
-```powershell
-node C:\dev\AnimeApp\app\node_modules\typescript\bin\tsc -p tsconfig.json
+Установка из репозитория (в npm пакет не публиковался):
+
+```bash
+npm install github:hoshi-app/MediaProxyLib
 ```
 
-Внутри Expo-приложения используется обычный Gradle-модуль `android/` (AGP + expo-module-gradle-plugin);
-эта сборка требует host-проект и доступ к Maven, поэтому здесь не запускалась.
+Config-плагин в `app.json` / `app.config.js`:
 
-## Быстрый контракт
+```json
+{
+  "expo": {
+    "plugins": ["react-native-media-proxy"]
+  }
+}
+```
+
+Затем пересборка нативных проектов:
+
+```bash
+npx expo prebuild --clean
+```
+
+Плагин вносит два изменения, без которых loopback-запросы блокируются системой:
+
+- **iOS** — `NSAllowsLocalNetworking` в `Info.plist`.
+- **Android** — `network_security_config` с `cleartextTrafficPermitted` только для
+  `127.0.0.1`. Глобальный `usesCleartextTraffic` не включается.
+
+Если в проекте уже есть свой `android:networkSecurityConfig`, плагин не перезаписывает
+его и выводит предупреждение: домен `127.0.0.1` нужно добавить вручную.
+
+Для приложений без Expo (голый React Native) плагин не применяется — оба пункта
+прописываются в `Info.plist` и `AndroidManifest.xml` вручную.
+
+## Использование
+
+### Минимальный пример
 
 ```ts
 import * as MediaProxy from 'react-native-media-proxy';
 
-await MediaProxy.start();                       // один раз на процесс
-MediaProxy.setConfig({ maxCacheMB: 512 });      // политика — из JS
+await MediaProxy.start();
 
-const source = MediaProxy.resolve(origin, {
-  cacheKey: 't28825|p-cvh|e2|q720',             // стабильная идентичность кэша
-  headers: { 'User-Agent': '...' },             // уйдут на master/вариант/сегменты
-});
-// source.url = http://127.0.0.1:<port>/s/<sid>/<b64>/<name>.m3u8
-// source.cached — «кэш на диске включён», а НЕ «сегменты уже загружены»;
-// прогретое смотрите в MediaProxy.getStreamState(streamId).cachedAheadSec.
-// fail-open: source.url === origin или пустой streamId → играйте origin с теми же headers.
-
-const off = MediaProxy.onAuthRequired((e) => {
-  // 400/401/403/410: перерезолвить поток и перемонтировать плеер
-});
-
-// Завис поток посередине серии (плеер голодает, буфер не растёт)? Не перемонтируйте плеер:
-// перезапустите манифест на прокси — он перечитает media-плейлист (у CDN свежие URL сегментов,
-// другой edge/подпись) и заново поставит загрузку залипшего окна. Возврат — Promise.
-const r = await MediaProxy.restart(streamId);   // { queued, refreshed, segmentsChanged, reason }
-
-// Обычно этого не нужно: движок сам замечает «клиент просит, а байты не идут» (stallKickSec)
-// и перезапускает манифест без участия JS. Событие — для логов и метрик, не для ремонта.
-MediaProxy.onRecover((e) => {
-  // e = { streamId, segmentIndex, waitedSec, urlChanged }
+const source = MediaProxy.resolve('https://cdn.example.com/film/index.m3u8', {
+  // Постоянный ключ кэша: не меняется при перерезолве и перезапуске.
+  cacheKey: 'film42|voice-ru|ep3|q720',
+  headers: {
+    'User-Agent': 'Mozilla/5.0 ...',
+    'Referer': 'https://example.com/',
+  },
 });
 ```
 
-Методы: `start`, `resolve`, `release`, `failOpen`, `nudge`, `restart`, `setConfig`, `getStats`,
-`getStreamState`, `clearCache`; события: `onError`, `onAuthRequired`, `onServerState`, `onCache`,
-`onRecover`. В `getStats()` — `stallKicks` (сколько раз движок перечитывал манифест сам) и
-`originTruncated` (сколько обрывов тела отдал origin: диагностика «залипшего edge»).
-Плейлисты, Range, prefetch, лимит кэша и вытеснение — нативно; JS только задаёт политику и
-разбирает ошибки.
+`source.url` передаётся плееру. `cached: true` означает «кэш на диске включён», а не
+«сегменты уже загружены»; прогретую часть смотрите в `getStreamState().cachedAheadSec`.
+Если `cached: false` — играйте исходный URL с теми же заголовками.
 
+### Компонент плеера
+
+```tsx
+import { useEffect, useMemo, useState } from 'react';
+import Video from 'react-native-video';
+import * as MediaProxy from 'react-native-media-proxy';
+
+export function Player({ url, headers, cacheKey }) {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    MediaProxy.start().then(() => setReady(true));
+  }, []);
+
+  const source = useMemo(() => {
+    const resolved = ready
+      ? MediaProxy.resolve(url, { cacheKey, headers })
+      : { url, cached: false };
+    return { uri: resolved.cached ? resolved.url : url, headers };
+  }, [ready, url, cacheKey, headers]);
+
+  return <Video source={source} />;
+}
+```
+
+### Состояние кэша
+
+```ts
+const state = MediaProxy.getStreamState(source.streamId);
+
+state.cachedAheadSec; // сколько секунд вперёд уже на диске
+state.segments;       // по каждому сегменту: cachedBytes, complete
+```
+
+### Обработка ошибок
+
+```ts
+MediaProxy.onAuthRequired((e) => {
+  // 400/401/403/410: истекла подпись, сменился IP, протухла сессия.
+  // Требуется новый URL от API приложения и перемонтирование плеера.
+  console.log(e.streamId, e.originStatus);
+});
+
+MediaProxy.onError((e) => {
+  console.log(e.code, e.message, e.retryable, e.fatal);
+});
+
+MediaProxy.onRecover((e) => {
+  // Движок перечитал плейлист и возобновил загрузку без перемонтирования плеера.
+});
+```
+
+## Проверка работоспособности
+
+```ts
+MediaProxy.setConfig({ debug: true });
+```
+
+1. Логи: созданные ссылки, источник байтов, ошибки. Подписи и токены вырезаются.
+2. Заголовок ответа `X-MediaProxy-Cache: hit | miss | partial | passthrough`
+   (только при `debug: true`).
+3. `getStats()`: занято на диске, попадания, промахи, число автовосстановлений.
+
+При повторном просмотре того же ролика `hits` растут, `misses` не меняются.
+
+## API
+
+### Методы
+
+| Метод | Описание |
+|---|---|
+| `start()` | Поднимает сервер. Один раз за процесс. Возвращает порт и список проблем. |
+| `resolve(url, options?)` | Создаёт сессию, возвращает ссылку для плеера. Синхронный, не бросает. |
+| `release(streamId)` | Освобождает сессию, отменяет предзагрузку. Кэш остаётся на диске. |
+| `failOpen(streamId)` | Переводит сессию на исходный URL (после ошибки плеера). |
+| `nudge(streamId)` | Ставит окно предзагрузки от последнего запрошенного сегмента. |
+| `restart(streamId)` | Перечитывает плейлист и заново ставит загрузку. Не требует перемонтирования. |
+| `setConfig(patch)` | Меняет политику на ходу. |
+| `getStats()` | Порт, объём кэша, попадания, промахи, восстановления. |
+| `getStreamState(streamId)` | Состояние сегментов: байты на диске, признак завершения. |
+| `clearCache(streamId?)` | Очищает кэш целиком или для одного видео. |
+
+### События
+
+| Событие | Содержание |
+|---|---|
+| `onError` | Один раз на переход в состояние ошибки: код, статус источника, текст. |
+| `onAuthRequired` | 400/401/403/410 — требуется новый URL. |
+| `onServerState` | Запуск, перезапуск, остановка сервера. |
+| `onCache` | Вытеснение, очистка, заполнение. |
+| `onRecover` | Автоматическое восстановление после зависания. |
+
+### Настройки
+
+`setConfig(patch)` — частичное обновление; неизвестные ключи игнорируются. Полный
+список — в [src/types.ts](src/types.ts).
+
+| Параметр | По умолчанию | Описание |
+|---|---|---|
+| `enabled` | `true` | Включает прокси. |
+| `maxCacheMB` | `512` | Лимит кэша на диске. |
+| `minFreeDiskMB` | `2048` | Ниже этого объёма свободного места кэширование отключается. |
+| `maxSessions` | `4` | Число одновременных сессий. |
+| `prefetchSeconds` | `30` | Глубина предзагрузки в секундах. |
+| `prefetchMaxSegments` | `6` | Предел сегментов в окне предзагрузки. |
+| `prefetchConcurrency` | `2` | Параллельных загрузок предзагрузки. |
+| `prefetchRetries` | `3` | Повторы для предзагрузки. |
+| `cooldownSec` | `30` | Пауза между попытками для упавшего сегмента. |
+| `prewarmSegments` | `2` | Сегменты, загружаемые сразу после `resolve`. |
+| `stallKickSec` | `6` | Отсутствие прироста байтов, после которого движок перечитывает плейлист. |
+| `recoveryMax` | `2` | Попыток восстановления на сегмент. |
+| `debug` | `false` | Логи и заголовок `X-MediaProxy-Cache`. |
+
+Таймауты (`reqConnectSec`, `reqFirstByteSec`, `reqSilenceSec`, `prefetchFirstByteSec`,
+`prefetchSilenceSec`) заданы короче таймаутов плееров: иначе плеер успевает
+перемонтировать источник раньше, чем прокси реагирует.
+
+## Кэш
+
+- Каталог: `Caches/mediaproxy/v1/<хеш cacheKey>/`.
+- Лимит по умолчанию — 512 МБ суммарно на все видео.
+- Вытеснение выполняется целыми записями каталога. Сегменты внутри записи не
+  вытесняются: эпизод смотрится последовательно.
+- Активная запись (запрос за последние две минуты) не вытесняется.
+- При 90 % лимита предзагрузка останавливается; при 100 % новые записи не
+  создаются, отдача продолжается.
+- При старте приложения журнал сверяется с файлами: короткие файлы подрезаются,
+  лишние удаляются.
+- `clearCache()` очищает всё, `clearCache(streamId)` — только эту запись.
+
+## Совместимость
+
+- Expo (модуль собран как Expo-модуль, требует `expo-modules-core`).
+- iOS 15.0+.
+- Плееры: `react-native-video`, `expo-video` и любой другой, принимающий обычный URL.
+
+## Статус
+
+Проект экспериментальный. Проверено:
+
+| Часть | Состояние |
+|---|---|
+| Android-ядро (Kotlin) | собрано, 301 автоматическая проверка проходит |
+| TypeScript-обвязка | проверка типов проходит |
+| Android-библиотека целиком (Gradle + Expo-слой) | не собиралась: нужен host-проект |
+| iOS (Swift) | собирается успешно |
+| CI | отсутствует |
+| Замеры производительности на реальных роликах | не проводились |
+
+## Документация
+
+- [docs/PROTOCOL.md](docs/PROTOCOL.md) — контракт поведения iOS и Android: ответы,
+  коды, состояния кэша.
+- [docs/PLAN.md](docs/PLAN.md) — обоснование решений и ограничений.
+
+## Лицензия
+
+[MIT](LICENSE): использование, изменение и распространение без ограничений, включая
+закрытые и коммерческие проекты. Условие — сохранить текст лицензии и указание
+авторства.

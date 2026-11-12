@@ -1,8 +1,8 @@
 # MediaProxy — лёгкий HLS-прокси для React Native (iOS + Android): план
 
-> Статус: утверждён. Порядок работ: план → Swift-ядро (пишется, не собирается) → Kotlin-ядро → TS-оболочка →
-> тесты Android и фиксы (1 фикс = 1 коммит). Локальная сборка возможна только для Android/Kotlin:
-> JDK 17 + Android SDK + кэш Gradle, без сети (Maven недоступен). Swift на этой машине не собирается.
+> Статус: утверждён. Порядок работ: план → Swift-ядро (собирается) → Kotlin-ядро → TS-оболочка →
+> тесты Android и фиксы (1 фикс = 1 коммит). Локальная сборка: Swift — на macOS (CocoaPods/Expo);
+> Android/Kotlin — JDK 17 + Android SDK + кэш Gradle, без сети (Maven недоступен).
 
 ## 0. Коротко
 

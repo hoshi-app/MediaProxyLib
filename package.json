@@ -5,6 +5,14 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hoshi-app/MediaProxyLib.git"
+  },
+  "homepage": "https://github.com/hoshi-app/MediaProxyLib#readme",
+  "bugs": {
+    "url": "https://github.com/hoshi-app/MediaProxyLib/issues"
+  },
   "files": [
     "src",
     "ios",
