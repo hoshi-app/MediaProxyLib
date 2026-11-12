@@ -101,7 +101,12 @@ class HttpServer(
         if (parts.size < 2) return null
         val method = parts[0].uppercase()
         if (method != "GET" && method != "HEAD") return null
-        val path = parts[1].substringBefore('?')
+        var path = parts[1].substringBefore('?')
+        // absolute-form (RFC 7230 §5.3.2): некоторые клиенты шлют полный URL вместо пути.
+        // Без нормализации такой запрос уходил бы в 404, хотя ресурс есть.
+        if (path.startsWith("http://", ignoreCase = true) || path.startsWith("https://", ignoreCase = true)) {
+            path = runCatching { java.net.URI(path).path ?: path }.getOrDefault(path)
+        }
 
         var range: String? = null
         var connection: String? = null
@@ -149,7 +154,7 @@ class HttpServer(
         }
 
         headers["Accept-Ranges"] = if (length >= 0) "bytes" else "none"
-        headers["Connection"] = if (request.keepAlive) "keep-alive" else "close"
+        headers["Connection"] = if (request.keepAlive && length >= 0) "keep-alive" else "close"
         if (length >= 0) headers["Content-Length"] = length.toString()
         reply.cacheState?.let { headers.putIfAbsent("X-MediaProxy-Cache", it) }
 

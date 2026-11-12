@@ -181,16 +181,25 @@ class GrowingFileBody(private val file: File, private val feed: ByteFeed) : Http
     }
 }
 
-/** Pass-through: отдаём по мере прихода из памяти (без диска). */
+/**
+ * Pass-through: отдаём по мере прихода из памяти (без диска). Тело не должно оказаться короче
+ * обещанного `Content-Length`: при провале рвём соединение, иначе плеер будет ждать хвост.
+ */
 class StreamBody(private val feed: ByteFeed) : HttpResponseBody {
     override fun write(out: OutputStream, offset: Long, count: Long, deadlineMs: Long) {
-        while (true) {
+        var sent = 0L
+        while (count < 0 || sent < count) {
             val left = deadlineMs - nowMs()
             if (left <= 0) throw IOException("deadline")
-            val chunk = feed.readChunk(64 * 1024, left) ?: return
+            val chunk = feed.readChunk(64 * 1024, left) ?: break
             if (chunk.isEmpty()) continue
             out.write(chunk)
             out.flush()
+            sent += chunk.size
+        }
+        if (count >= 0 && sent < count) {
+            feed.error?.let { throw IOException(it.wire) }
+            if (!feed.isFinished) throw IOException("stream interrupted")
         }
     }
 }

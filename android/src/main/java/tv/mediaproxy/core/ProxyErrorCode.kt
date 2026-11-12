@@ -48,6 +48,9 @@ enum class ProxyErrorCode(
             403 -> ORIGIN_403
             404 -> ORIGIN_404
             410 -> ORIGIN_410
+            // 416 на наш Range означает, что префикс не подходит к ресурсу: движок сбрасывает
+            // сегмент и начинает его заново, а не отдаёт склейку.
+            416 -> RANGE_UNSUPPORTED
             429 -> ORIGIN_429
             in 400..499 -> ORIGIN_400
             else -> ORIGIN_5XX

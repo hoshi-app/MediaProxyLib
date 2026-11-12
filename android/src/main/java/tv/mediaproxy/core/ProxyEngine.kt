@@ -63,6 +63,7 @@ class ProxyEngine(private val root: File) {
         val finalUrl: String,
         val text: String,
         val result: RewriteResult,
+        val fetchedAt: Long = nowMs(),
     ) {
         val data: ByteArray = text.toByteArray(Charsets.UTF_8)
         val indexByUrl: Map<String, Int> = result.media.segments.associate { it.url to it.index }
@@ -108,7 +109,6 @@ class ProxyEngine(private val root: File) {
     private val hits = AtomicLong(0)
     private val misses = AtomicLong(0)
     private val prefetchedCount = AtomicLong(0)
-    private val evictions = AtomicLong(0)
 
     /** События в JS: onError, onAuthRequired, onServerState, onCache. */
     var onEvent: ((name: String, payload: Map<String, Any?>) -> Unit)? = null
@@ -186,10 +186,24 @@ class ProxyEngine(private val root: File) {
     }
 
     private fun resizePools() {
-        interactive.corePoolSize = config.interactiveConcurrency
-        interactive.maximumPoolSize = config.interactiveConcurrency
-        prefetchPool.corePoolSize = config.prefetchConcurrency
-        prefetchPool.maximumPoolSize = config.prefetchConcurrency
+        resize(interactive, config.interactiveConcurrency)
+        resize(prefetchPool, config.prefetchConcurrency)
+    }
+
+    /**
+     * Порядок присвоений важен: `ThreadPoolExecutor` требует core ≤ max, поэтому при повышении
+     * сначала поднимается `maximumPoolSize`, при понижении — сначала `corePoolSize`.
+     */
+    private fun resize(pool: ThreadPoolExecutor, requested: Int) {
+        val size = requested.coerceAtLeast(1)
+        if (pool.maximumPoolSize == size && pool.corePoolSize == size) return
+        if (size > pool.maximumPoolSize) {
+            pool.maximumPoolSize = size
+            pool.corePoolSize = size
+        } else {
+            pool.corePoolSize = size
+            pool.maximumPoolSize = size
+        }
     }
 
     /**
@@ -320,7 +334,13 @@ class ProxyEngine(private val root: File) {
     }
 
     private fun loadPlaylist(session: Session, url: String): HttpReply {
-        session.playlists[url]?.let { return playlistReply(it) }
+        session.playlists[url]?.let { cached ->
+            // Кэшируемый VOD-плейлист неизменен, а live/event обязан перечитываться: иначе
+            // воспроизведение «замерзает» на первом же списке сегментов (§5.5).
+            if (cached.result.cacheable || nowMs() - cached.fetchedAt < playlistTtlMs(cached)) {
+                return playlistReply(cached)
+            }
+        }
         val cfg = config
         val profile = TimeoutProfile.playlist(cfg)
         val fetched = origin.fetchPlaylist(url, headersFor(session, url), profile, cfg.maxPlaylistBytes)
@@ -356,7 +376,9 @@ class ProxyEngine(private val root: File) {
                 Log.line("playlist", "без кэша: ${rewritten.reason} $url")
             }
             ensureStream(session, rewritten.fingerprint)
-            if (cfg.prewarmSegments > 0) {
+            // Прогрев имеет смысл только для кэшируемого VOD: у live/BYTERANGE/DRM первые
+            // «сегменты» — это либо пустая трата трафика, либо весь медиафайл целиком.
+            if (cfg.prewarmSegments > 0 && session.cacheable) {
                 session.stream?.let { stream ->
                     rewritten.media.segments.take(cfg.prewarmSegments).forEach { segment ->
                         enqueuePrefetch(session, stream, segment)
@@ -366,6 +388,13 @@ class ProxyEngine(private val root: File) {
         }
         return playlistReply(resource)
     }
+
+    /**
+     * Срок жизни не-cacheable плейлиста. Плеер перезапрашивает live-плейлист раз в таргет-дирекшн,
+     * и прокси обязан к этому моменту сходить в origin — иначе список сегментов «замерзает».
+     */
+    private fun playlistTtlMs(resource: PlaylistResource): Long =
+        maxOf((resource.result.media.targetDuration * 1000).toLong(), 2_000L)
 
     private fun playlistReply(resource: PlaylistResource): HttpReply = HttpReply(
         status = 200,
@@ -409,9 +438,9 @@ class ProxyEngine(private val root: File) {
         misses.incrementAndGet()
         val feed = ensureDownload(session, stream, segment, TimeoutProfile.interactive(cfg))
             ?: return passThrough(session, url, range, cacheable = false)
-        val firstError = feed.waitForFirstBytes((cfg.reqFirstByteSec * 1000).toLong())
+        val firstError = feed.waitForMeta((cfg.reqFirstByteSec * 1000).toLong())
         if (firstError != null) {
-            notifyError(session, url, firstError, 1)
+            // Событие отдаёт загрузчик (runDownload): иначе на один сбой приходило бы два onError.
             return errorReply(firstError)
         }
         val total = feed.total
@@ -442,7 +471,7 @@ class ProxyEngine(private val root: File) {
             mergeCookies(session, url, result.setCookies)
             if (result.code != null) feed.fail(result.code!!) else feed.finish()
         }
-        val firstError = feed.waitForFirstBytes((cfg.reqFirstByteSec * 1000).toLong())
+        val firstError = feed.waitForMeta((cfg.reqFirstByteSec * 1000).toLong())
         if (firstError != null) {
             notifyError(session, url, firstError, 1)
             return errorReply(firstError)
@@ -453,11 +482,14 @@ class ProxyEngine(private val root: File) {
         if (total < 0) {
             return HttpReply(
                 status = 200, headers = headers, body = StreamBody(feed), length = -1,
-                cacheState = debugState("passthrough"),
+                // Поток нельзя сдвинуть: сервер не должен резать его своим Range.
+                cacheState = debugState("passthrough"), rangeHandled = true,
             )
         }
         if (start > 0) {
-            headers["Content-Range"] = "bytes $start-${start + total - 1}/${start + total}"
+            // `total` — полный размер ресурса, поэтому Content-Range идёт от `start` до `total-1`,
+            // а длина тела — хвост. Раньше здесь считалось `start + total`, и разбор уезжал.
+            headers["Content-Range"] = "bytes $start-${total - 1}/$total"
             return HttpReply(
                 status = 206, headers = headers, body = StreamBody(feed), length = total - start,
                 cacheState = debugState("passthrough"), rangeHandled = true,
@@ -465,7 +497,7 @@ class ProxyEngine(private val root: File) {
         }
         return HttpReply(
             status = 200, headers = headers, body = StreamBody(feed), length = total,
-            cacheState = debugState("passthrough"), rangeHandled = range != null,
+            cacheState = debugState("passthrough"), rangeHandled = true,
         )
     }
 
@@ -483,14 +515,13 @@ class ProxyEngine(private val root: File) {
         synchronized(downloadsLock) {
             downloads[key]?.let { return it.feed }
             if (!cache.evictIfNeeded(0, setOf(session.cacheKey), nowMs())) return null
-            val feed = ByteFeed(cache.fileURL(stream, segment.index))
+            val feed = openFeed(stream, segment.index)
             val download = Download(key, session, stream, segment, feed, isPrefetch = false)
             downloads[key] = download
             cache.retain(stream)
             cache.update(stream, segment.index) {
                 it.downloading = true
-                it.total = -1
-                it.prefix = 0
+                it.prefix = feed.written
                 it.complete = false
                 it.failedUntil = 0
             }
@@ -499,12 +530,41 @@ class ProxyEngine(private val root: File) {
         }
     }
 
+    /**
+     * Feed сегмента. Если на диске уже лежит префикс (сорвавшийся прошлый запрос), он не затирается,
+     * а докачивается: `written` стартует с размера файла, и загрузчик шлёт `Range: bytes=<prefix>-`.
+     */
+    private fun openFeed(stream: CacheStore.Stream, index: Int): ByteFeed {
+        val file = cache.fileURL(stream, index)
+        return ByteFeed(file, Fs.size(file))
+    }
+
     private fun runDownload(download: Download, profile: TimeoutProfile) {
         val cfg = config
+        val index = download.segment.index
         var attempt = 0
         try {
+            // Файл уже содержит весь сегмент, но запись не была закоммичена (сбой между записью и
+            // журналом): докачивать нечего, иначе Range за пределом ресурса даст 416.
+            val knownTotal = cache.entry(download.stream, index)?.total ?: -1L
+            if (download.feed.written > 0 && knownTotal > 0 && download.feed.written >= knownTotal) {
+                download.feed.finish()
+                cache.update(download.stream, index) {
+                    it.total = knownTotal
+                    it.prefix = knownTotal
+                    it.complete = true
+                    it.downloading = false
+                }
+                if (download.isPrefetch) prefetchedCount.incrementAndGet()
+                return
+            }
             while (!download.cancelled.get()) {
                 val start = download.feed.written
+                val ifRange = if (start > 0) {
+                    download.feed.etag ?: cache.entry(download.stream, index)?.etag
+                } else {
+                    null
+                }
                 val headers = headersFor(download.session, download.segment.url)
                 val request = OriginClient.Request(
                     url = download.segment.url,
@@ -512,6 +572,7 @@ class ProxyEngine(private val root: File) {
                     rangeStart = start,
                     profile = profile,
                     isPrefetch = download.isPrefetch,
+                    ifRange = ifRange,
                 )
                 val result = origin.download(request, download.feed)
                 mergeCookies(download.session, download.segment.url, result.setCookies)
@@ -521,32 +582,43 @@ class ProxyEngine(private val root: File) {
                     val total = download.feed.total
                     val written = download.feed.written
                     download.feed.finish()
-                    cache.ensureEntry(download.stream, download.segment.index, nowMs())
-                    cache.update(download.stream, download.segment.index) {
+                    cache.ensureEntry(download.stream, index, nowMs())
+                    cache.update(download.stream, index) {
                         it.total = total
                         it.prefix = written
                         it.complete = total >= 0 && written == total
                         it.downloading = false
                         it.feed = download.feed
                         it.contentType = download.feed.contentType
+                        it.etag = download.feed.etag
                         it.lastAccess = nowMs()
                     }
-                    prefetchedCount.incrementAndGet()
+                    if (download.isPrefetch) prefetchedCount.incrementAndGet()
                     return
                 }
 
                 if (code == ProxyErrorCode.RANGE_UNSUPPORTED && start > 0) {
-                    cache.update(download.stream, download.segment.index) {
+                    // Префикс не подходит к текущему ресурсу (сменился контент или подпись):
+                    // начинаем сегмент заново, иначе отдадим склейку из двух разных файлов.
+                    download.feed.file?.let { Fs.truncate(it, 0) }
+                    download.feed.fail(code)
+                    cache.ensureEntry(download.stream, index, nowMs())
+                    cache.update(download.stream, index) {
                         it.total = -1
                         it.prefix = 0
                         it.complete = false
                         it.downloading = false
+                        it.etag = null
                     }
+                    notifyError(download.session, download.segment.url, code, attempt + 1)
                     return
                 }
 
                 attempt++
-                if (code.retryable && attempt <= cfg.prefetchRetries && !download.cancelled.get()) {
+                // Ретраит плеер, а не мы: нативные повторы только для prefetch и продолжений,
+                // где байты уже шли (§6.3). Иначе наш бюджет складывается с бюджетом плеера.
+                val mayRetry = download.isPrefetch || start > 0 || download.feed.written > start
+                if (code.retryable && mayRetry && attempt <= cfg.prefetchRetries && !download.cancelled.get()) {
                     val backoff = cfg.retryBackoffMs[minOf(attempt - 1, cfg.retryBackoffMs.lastIndex)]
                     runCatching { Thread.sleep(backoff) }
                     continue
@@ -555,14 +627,15 @@ class ProxyEngine(private val root: File) {
                 val written = download.feed.written
                 val total = download.feed.total
                 download.feed.fail(code)
-                cache.ensureEntry(download.stream, download.segment.index, nowMs())
-                cache.update(download.stream, download.segment.index) {
+                cache.ensureEntry(download.stream, index, nowMs())
+                cache.update(download.stream, index) {
                     it.total = total
                     it.prefix = written
                     it.complete = total >= 0 && written == total
                     it.downloading = false
                     it.failedUntil = nowMs() + (cfg.cooldownSec * 1000).toLong()
                     it.feed = download.feed
+                    it.etag = download.feed.etag
                 }
                 notifyError(download.session, download.segment.url, code, attempt)
                 return
@@ -597,12 +670,17 @@ class ProxyEngine(private val root: File) {
     }
 
     private fun enqueuePrefetch(session: Session, stream: CacheStore.Stream, segment: PlaylistSegment): Boolean {
+        if (!session.cacheable) return false
         val key = "${stream.key}#${segment.index}"
         val marker = "${session.cacheKey}|${segment.index}"
         synchronized(downloadsLock) {
             if (downloads.containsKey(key) || prefetched.contains(marker)) return false
+            val existing = cache.entry(stream, segment.index)
+            // Уже скачано или недавно провалилось — новый запрос только тратит трафик.
+            if (existing?.complete == true) return false
+            if ((existing?.failedUntil ?: 0L) > nowMs()) return false
             if (!cache.evictIfNeeded(0, setOf(session.cacheKey), nowMs())) return false
-            val feed = ByteFeed(cache.fileURL(stream, segment.index))
+            val feed = openFeed(stream, segment.index)
             val download = Download(key, session, stream, segment, feed, isPrefetch = true)
             downloads[key] = download
             prefetched.add(marker)
@@ -612,8 +690,7 @@ class ProxyEngine(private val root: File) {
             cache.ensureEntry(stream, segment.index, nowMs())
             cache.update(stream, segment.index) {
                 it.downloading = true
-                it.total = -1
-                it.prefix = 0
+                it.prefix = feed.written
                 it.complete = false
                 it.failedUntil = 0
             }
@@ -646,7 +723,7 @@ class ProxyEngine(private val root: File) {
         "streams" to sessions.size,
         "hits" to hits.get(),
         "misses" to misses.get(),
-        "evictions" to evictions.get(),
+        "evictions" to cache.evictedCount(),
         "prefetched" to prefetchedCount.get(),
         "maxSessions" to config.maxSessions,
     )
@@ -688,8 +765,14 @@ class ProxyEngine(private val root: File) {
     }
 
     fun clearCache(streamId: String? = null): Map<String, Any?> {
-        val cacheKey = streamId?.let { sessions[it]?.cacheKey }
-        val freed = cache.clear(cacheKey)
+        // Без streamId — чистим всё. С streamId неизвестной сессии — ничего: иначе clearCache
+        // по уже освобождённому id молча стирал бы весь кэш приложения.
+        val freed: Long = if (streamId == null) {
+            cache.clear(null)
+        } else {
+            val session = sessions[streamId] ?: return mapOf("freedBytes" to 0L)
+            cache.clear(session.cacheKey)
+        }
         emit("onCache", mapOf("type" to "clear", "bytes" to cache.totalBytes(), "maxBytes" to config.maxCacheBytes))
         return mapOf("freedBytes" to freed)
     }

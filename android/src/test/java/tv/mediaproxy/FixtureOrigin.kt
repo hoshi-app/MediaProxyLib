@@ -36,6 +36,8 @@ class FixtureOrigin {
     val plainUrl: String get() = "$baseUrl/plain"
     val encryptedUrl: String get() = "$baseUrl/enc.m3u8"
     val resumeUrl: String get() = "$baseUrl/resume.m3u8"
+    val resume2Url: String get() = "$baseUrl/resume2.m3u8"
+    val flakyUrl: String get() = "$baseUrl/flaky.m3u8"
 
     fun start(): FixtureOrigin {
         server.executor = executor
@@ -81,6 +83,12 @@ class FixtureOrigin {
     fun resumePlaylist(): String =
         "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\n$baseUrl/resume-flaky\n#EXT-X-ENDLIST\n"
 
+    fun resume2Playlist(): String =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\n$baseUrl/resume2\n#EXT-X-ENDLIST\n"
+
+    fun flakyPlaylist(): String =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\n$baseUrl/flaky\n#EXT-X-ENDLIST\n"
+
     private fun masterPlaylist(): String = buildString {
         appendLine("#EXTM3U")
         appendLine("#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=1280x720,CODECS=\"avc1.64001f,mp4a.40.2\"")
@@ -91,8 +99,8 @@ class FixtureOrigin {
 
     private fun livePlaylist(): String = buildString {
         appendLine("#EXTM3U")
-        appendLine("#EXT-X-TARGETDURATION:4")
-        appendLine("#EXTINF:4.000,")
+        appendLine("#EXT-X-TARGETDURATION:2")
+        appendLine("#EXTINF:2.000,")
         appendLine("$baseUrl/seg/0.ts?tok=$token")
     }
 
@@ -112,8 +120,11 @@ class FixtureOrigin {
                 bump("live")
                 send(exchange, 200, "application/vnd.apple.mpegurl", livePlaylist().toByteArray(), range)
             }
-            path == "/bad.m3u8" -> {
-                bump("bad-playlist")
+            path == "/flaky.m3u8" -> {
+                bump("flaky-playlist")
+                send(exchange, 200, "application/vnd.apple.mpegurl", flakyPlaylist().toByteArray(), range)
+            }
+            path == "/bad.m3u8" -> {                bump("bad-playlist")
                 val text = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.000,\n$baseUrl/bad.ts\n#EXT-X-ENDLIST\n"
                 send(exchange, 200, "application/vnd.apple.mpegurl", text.toByteArray(), range)
             }
@@ -159,6 +170,24 @@ class FixtureOrigin {
             path == "/resume.m3u8" -> {
                 bump("resume-playlist")
                 send(exchange, 200, "application/vnd.apple.mpegurl", resumePlaylist().toByteArray(), range)
+            }
+            path == "/resume2.m3u8" -> {
+                bump("resume2-playlist")
+                send(exchange, 200, "application/vnd.apple.mpegurl", resume2Playlist().toByteArray(), range)
+            }
+            // Рвётся на КАЖДОМ запросе без Range (400 из 1000 байт), а с Range — отдаёт хвост.
+            // Так проверяется докачка между запросами плеера, а не только внутри одной загрузки.
+            path == "/resume2" -> {
+                bump("resume2")
+                recordedHeaders["resume2-range"] = exchange.requestHeaders.getFirst("Range") ?: ""
+                if (range == null) {
+                    exchange.sendResponseHeaders(200, segmentSize.toLong())
+                    exchange.responseBody.write(segmentBytes, 0, 400)
+                    exchange.responseBody.flush()
+                    exchange.close()
+                } else {
+                    send(exchange, 200, "video/mp2t", segmentBytes, range)
+                }
             }
             path == "/resume-flaky" -> {
                 val n = counters.computeIfAbsent("resume-flaky") { AtomicInteger(0) }.incrementAndGet()

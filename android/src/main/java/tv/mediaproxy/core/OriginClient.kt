@@ -26,6 +26,8 @@ class OriginClient(private val config: () -> ProxyConfig) {
         val rangeStart: Long,
         val profile: TimeoutProfile,
         val isPrefetch: Boolean,
+        /** ETag для `If-Range`: докачка с префикса не должна склеивать две версии ресурса. */
+        val ifRange: String? = null,
     )
 
     data class DownloadResult(
@@ -62,7 +64,12 @@ class OriginClient(private val config: () -> ProxyConfig) {
     fun download(request: Request, feed: ByteFeed): DownloadResult {
         val builder = OkRequest.Builder().url(request.url)
         applyHeaders(builder, request.headers)
-        if (request.rangeStart > 0) builder.header("Range", "bytes=${request.rangeStart}-")
+        if (request.rangeStart > 0) {
+            builder.header("Range", "bytes=${request.rangeStart}-")
+            // Если ресурс сменился, origin обязан ответить 200 с целым телом, и мы не склеим
+            // префикс старой версии с хвостом новой (тогда сработает RANGE_UNSUPPORTED).
+            request.ifRange?.let { builder.header("If-Range", it) }
+        }
 
         val client = baseClient.newBuilder()
             .connectTimeout(request.profile.connectMs, TimeUnit.MILLISECONDS)
@@ -121,8 +128,14 @@ class OriginClient(private val config: () -> ProxyConfig) {
                         return DownloadResult(ProxyErrorCode.RANGE_UNSUPPORTED, null, cookies)
                     }
                     total = parsed.third
+                    // Ресурс короче нашего префикса — докачивать нечего,Range невалиден.
+                    if (total in 0 until request.rangeStart) {
+                        return DownloadResult(ProxyErrorCode.RANGE_UNSUPPORTED, null, cookies)
+                    }
                 }
                 val finalUrl = response.request.url.toString()
+                // База до чтения тела: у докачки `written` уже содержит префикс, у pass-through — 0.
+                val baseline = feed.written
                 feed.setMeta(total, contentType, finalUrl, response.header("ETag"))
                 val body = response.body ?: return DownloadResult(ProxyErrorCode.EMPTY_RESPONSE, finalUrl, cookies)
                 val input = body.byteStream()
@@ -135,7 +148,11 @@ class OriginClient(private val config: () -> ProxyConfig) {
                     speedCounter.addAndGet(n.toLong())
                     feed.append(buffer, 0, n)
                 }
-                if (total >= 0 && feed.written != total) {
+                // Ожидаем `baseline + длина тела`. Для 206 `total` — размер ВСЕГО ресурса, поэтому
+                // при Range отличном от нуля ожидание = total - rangeStart, иначе любой 206 с
+                // докачкой/pass-through ложно считался бы TRUNCATED.
+                val expected = if (total >= 0) baseline + (total - request.rangeStart) else -1L
+                if (expected >= 0 && feed.written != expected) {
                     return DownloadResult(ProxyErrorCode.TRUNCATED, finalUrl, cookies)
                 }
                 if (feed.written == 0L) {

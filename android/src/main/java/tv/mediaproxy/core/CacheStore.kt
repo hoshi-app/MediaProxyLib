@@ -18,6 +18,8 @@ class CacheStore(
         var complete: Boolean = false,
         var failedUntil: Long = 0,
         var contentType: String? = null,
+        /** ETag последнего ответа origin: нужен для `If-Range` при докачке с префикса. */
+        var etag: String? = null,
         var downloading: Boolean = false,
         var feed: ByteFeed? = null,
         val file: File,
@@ -38,6 +40,7 @@ class CacheStore(
 
     private val lock = Object()
     private val streams = HashMap<String, Stream>()
+    private var evictedStreams = 0L
 
     init {
         Fs.ensureDir(root)
@@ -146,10 +149,14 @@ class CacheStore(
                 candidate.pendingDelete = true
                 streams.remove(candidate.key)
                 candidate.dir.deleteRecursively()
+                evictedStreams++
             }
             return totalBytesLocked() + required <= cfg.maxCacheBytes
         }
     }
+
+    /** Сколько стримов вытеснено с момента старта — для `getStats().evictions`. */
+    fun evictedCount(): Long = synchronized(lock) { evictedStreams }
 
     private fun totalBytesLocked(): Long = streams.values.sumOf { streamBytesLocked(it) }
 
@@ -180,6 +187,16 @@ class CacheStore(
     private fun loadLocked(stream: Stream) {
         val journal = File(stream.dir, "journal.log")
         val lines = Fs.readLines(journal)
+        // Шапка — единственный способ после рестарта процесса отличить «тот же контент» от другого
+        // плейлиста с тем же cacheKey. Без сверки отпечатка отдавались бы готовые сегменты чужого
+        // контента (PROTOCOL §3). Формат H|2: отпечаток идёт ПЕРЕД cacheKey, потому что cacheKey
+        // приложения содержит `|` (`t1|p-x|e2|q720`), и разбирать его на части нельзя.
+        val header = lines.lastOrNull { it.startsWith("H|") }
+        val segments = lines.any { it.startsWith("S|") }
+        if (segments && !headerMatches(header, stream)) {
+            wipeLocked(stream)
+            return
+        }
         // Append-only журнал: последняя запись по индексу побеждает, сверка с файлом — один раз на запись.
         val latest = HashMap<Int, Entry>()
         for (line in lines) {
@@ -216,7 +233,7 @@ class CacheStore(
     private fun rewriteJournalLocked(stream: Stream) {
         val journal = File(stream.dir, "journal.log")
         val text = buildString {
-            append("H|1|").append(stream.cacheKey).append('|').append(stream.fingerprint).append('\n')
+            append("H|2|").append(stream.fingerprint).append('|').append(stream.cacheKey).append('\n')
             stream.entries.values.sortedBy { it.index }.forEach { e ->
                 append("S|").append(e.index).append('|').append(e.total).append('|').append(e.prefix)
                     .append('|').append(if (e.complete) 1 else 0).append('|').append(e.contentType ?: "")
@@ -228,6 +245,24 @@ class CacheStore(
         } catch (_: IOException) {
             // журнал — кэш: сбой записи не должен ломать воспроизведение
         }
+    }
+
+    private fun headerMatches(line: String?, stream: Stream): Boolean {
+        if (line == null) return false
+        val parts = line.split("|")
+        if (parts.size < 4 || parts[0] != "H" || parts[1] != "2") return false
+        val fingerprint = parts[2]
+        val cacheKey = parts.drop(3).joinToString("|")
+        return fingerprint == stream.fingerprint && cacheKey == stream.cacheKey
+    }
+
+    /** Снос невалидного каталога: чужие/битые записи не должны пережить смену плейлиста. */
+    private fun wipeLocked(stream: Stream) {
+        stream.entries.clear()
+        stream.dir.listFiles()?.forEach { file ->
+            if (file.name.endsWith(".bin") || file.name == "journal.log") file.delete()
+        }
+        rewriteJournalLocked(stream)
     }
 
     private fun journalLocked(stream: Stream, entry: Entry) {

@@ -4,7 +4,7 @@ package tv.mediaproxy.core
  * Общий буфер между загрузчиком и отдачей. Пишет в файл (кэш) или в память (pass-through).
  * Читатель ждёт `written >= N` на condition, а не EOF файла: иначе получит обрезанное тело (P-11).
  */
-class ByteFeed(val file: java.io.File?) {
+class ByteFeed(val file: java.io.File?, resumeFrom: Long = 0L) {
     private val monitor = Object()
     private var out: java.io.FileOutputStream? = null
     private var writtenBytes = 0L
@@ -12,6 +12,7 @@ class ByteFeed(val file: java.io.File?) {
     private var responseType: String? = null
     private var failure: ProxyErrorCode? = null
     private var finished = false
+    private var metaReady = false
     private var memory = java.io.ByteArrayOutputStream()
     private val firstBytes = java.io.ByteArrayOutputStream(64)
 
@@ -26,7 +27,14 @@ class ByteFeed(val file: java.io.File?) {
     init {
         if (file != null) {
             Fs.ensureDir(file.absoluteFile.parentFile)
-            java.io.RandomAccessFile(file, "rw").use { it.setLength(0) }
+            // Докачка с префикса: файл открывается на дозапись, `written` стартует с того, что уже
+            // лежит на диске (иначе повторный запрос плеера затирал бы прогретое — §2.4 п.9).
+            val resume = resumeFrom.coerceIn(0L, Fs.size(file))
+            if (resume > 0) {
+                writtenBytes = resume
+            } else {
+                java.io.RandomAccessFile(file, "rw").use { it.setLength(0) }
+            }
             out = java.io.FileOutputStream(file, true)
         }
     }
@@ -55,6 +63,7 @@ class ByteFeed(val file: java.io.File?) {
             responseType = contentType
             this.finalUrl = finalUrl
             this.etag = etag
+            metaReady = true
             monitor.notifyAll()
         }
     }
@@ -88,6 +97,25 @@ class ByteFeed(val file: java.io.File?) {
         }
         runCatching { out?.flush() }
         runCatching { out?.close() }
+    }
+
+    /**
+     * Ждёт метаданные ответа (размер/тип). Именно они нужны, чтобы решить, отдавать из кэша,
+     * пасsthrough или рвать по таймауту. Учитывает докачку: `written` может быть > 0 сразу
+     * (префикс уже на диске), и ждать «первый байт» в этом случае бессмысленно.
+     */
+    fun waitForMeta(timeoutMs: Long): ProxyErrorCode? {
+        val deadline = nowMs() + timeoutMs
+        synchronized(monitor) {
+            while (!metaReady && failure == null && !finished) {
+                val left = deadline - nowMs()
+                if (left <= 0) return failure ?: ProxyErrorCode.TIMEOUT_FIRST_BYTE
+                waitUntil(left)
+            }
+            failure?.let { return it }
+            if (!metaReady && finished && writtenBytes == 0L) return ProxyErrorCode.EMPTY_RESPONSE
+            return null
+        }
     }
 
     /** Ждёт первый байт/ошибку. null — дождались; иначе код (включая таймаут). */
