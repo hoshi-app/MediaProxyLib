@@ -1,4 +1,4 @@
-import Foundation
+﻿import Foundation
 
 public struct PlaylistSegment {
     public let index: Int
@@ -74,7 +74,7 @@ public enum PlaylistRewriter {
         var pendingCodecs: String? = nil
         var segmentIndex = 0
         var elapsed = 0.0
-        var lastVariantUrl: String? = nil
+
 
         for rawLine in text.components(separatedBy: "\n") {
             let hasCR = rawLine.hasSuffix("\r")
@@ -147,7 +147,7 @@ public enum PlaylistRewriter {
                 variants.append(PlaylistVariant(url: absolute, bandwidth: pendingBandwidth,
                                                 width: pendingWidth, height: pendingHeight, codecs: pendingCodecs))
                 pendingBandwidth = 0; pendingWidth = 0; pendingHeight = 0; pendingCodecs = nil
-                lastVariantUrl = absolute
+
                 out.append(proxyUrl)
             } else {
                 let duration = pendingDuration ?? 0

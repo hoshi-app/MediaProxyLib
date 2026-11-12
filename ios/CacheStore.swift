@@ -111,11 +111,10 @@ public final class CacheStore {
     @discardableResult
     public func ensureEntry(_ stream: Stream, index: Int, now: TimeInterval) -> Entry {
         lock.lock(); defer { lock.unlock() }
-        if var e = stream.entries[index] { return e }
-        var e = Entry(index: index, total: -1, prefix: 0, complete: false,
+        if let e = stream.entries[index] { return e }
+        let e = Entry(index: index, total: -1, prefix: 0, complete: false,
                       file: fileURL(stream, index), lastAccess: now)
         stream.entries[index] = e
-        e = stream.entries[index]!
         journal(stream, entry: e)
         return e
     }

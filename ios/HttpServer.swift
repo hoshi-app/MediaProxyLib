@@ -1,4 +1,4 @@
-import Foundation
+﻿import Foundation
 import Darwin
 
 /// Тело ответа: умеет писать только нужный диапазон (Range) в сокет.
@@ -40,7 +40,7 @@ public struct BytesBody: HttpResponseBody {
         let start = max(0, offset)
         guard start < Int64(data.count) else { return }
         let end = count < 0 ? Int64(data.count) : min(Int64(data.count), start + count)
-        var slice = data.subdata(in: Int(start)..<Int(end))
+        let slice = data.subdata(in: Int(start)..<Int(end))
         try slice.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             var written = 0
@@ -187,7 +187,7 @@ public final class HttpServer {
 
         var bound = sockaddr_in()
         var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        withUnsafeMutablePointer(to: &bound) {
+        _ = withUnsafeMutablePointer(to: &bound) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.getsockname(fd, $0, &len) }
         }
         boundPort = Int(UInt16(bigEndian: bound.sin_port))

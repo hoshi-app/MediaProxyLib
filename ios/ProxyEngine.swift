@@ -158,8 +158,11 @@ public final class ProxyEngine {
     public func start() -> (running: Bool, port: Int, error: String?) {
         if running, let server { return (true, server.boundPort, nil) }
         try? Fs.ensureDir(root)
-        cache = CacheStore(root: root, config: { [weak self] in self?.config ?? ProxyConfig() },
-                           diskFree: { Fs.freeDiskBytes(at: root) })
+        // rootUrl фиксируем локально: в escaping-замыкании обращение к свойству требует self,
+        // а захватывать self в замыкании кэша (self → cache → замыкание) не нужно.
+        let rootUrl = root
+        cache = CacheStore(root: rootUrl, config: { [weak self] in self?.config ?? ProxyConfig() },
+                           diskFree: { Fs.freeDiskBytes(at: rootUrl) })
         origin = OriginClient()
 
         let http = HttpServer(maxConnections: config.maxLoopbackConnections, idleTimeout: config.socketIdleSec) {
@@ -508,7 +511,7 @@ public final class ProxyEngine {
             downloadsLock.unlock()
             return existing.feed
         }
-        let cfg = config
+        // cfg здесь не нужен: эвикция читает конфиг сама.
         guard cache.evictIfNeeded(required: 0, protecting: [session.cacheKey], now: Date().timeIntervalSince1970) else {
             downloadsLock.unlock()
             return nil

@@ -123,7 +123,8 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         var req = URLRequest(url: parsed)
         req.httpMethod = "GET"
         req.cachePolicy = .reloadIgnoringLocalCacheData
-        req.timeoutInterval = max(1, profile.firstByteMs / 1000)
+        // firstByteMs — Int64, а timeoutInterval — TimeInterval (Double): без приведения не компилируется.
+        req.timeoutInterval = max(1, Double(profile.firstByteMs) / 1000)
         for (key, value) in headers {
             let lowered = key.lowercased()
             if lowered == "host" || lowered == "range" || lowered == "connection"

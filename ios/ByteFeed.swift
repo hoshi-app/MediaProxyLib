@@ -1,4 +1,4 @@
-import Foundation
+﻿import Foundation
 
 /// Общий буфер между загрузчиком и отдачей. Пишет либо в файл (кэш), либо в память (pass-through).
 /// Читатель ждёт `written >= N` на condition, а не EOF файла: иначе получит обрезанное тело (P-11).
@@ -30,9 +30,9 @@ public final class ByteFeed {
             handle = try? FileHandle(forWritingTo: file)
             if resume > 0 {
                 writtenBytes = resume
-                try? handle?.seekToEnd()
+                _ = try? handle?.seekToEnd()
             } else {
-                try? handle?.truncate(atOffset: 0)
+                _ = try? handle?.truncate(atOffset: 0)
             }
         }
     }
@@ -177,7 +177,7 @@ public final class ByteFeed {
         while memory.isEmpty && failure == nil && !finished {
             if !condition.wait(until: limit) { return Data() }
         }
-        if let failure { return nil }
+        if failure != nil { return nil }
         if memory.isEmpty { return nil }
         let count = min(maxBytes, memory.count)
         let chunk = memory.prefix(count)
