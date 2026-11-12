@@ -23,6 +23,13 @@ export type MediaProxyConfig = {
   minSpeedKBps: number;
   cooldownSec: number;
   prewarmSegments: number;
+  /**
+   * Вотчдог зависшей загрузки: через сколько секунд без прироста байт движок сам перечитывает
+   * манифест (0 — выключить).
+   */
+  stallKickSec: number;
+  /** Сколько таких киков допускается на один сегмент, прежде чем движок сдаётся плееру. */
+  recoveryMax: number;
   /** stream = tee (по умолчанию), complete = сначала сегмент целиком (fallback после S3). */
   serving: ServingMode;
   debug: boolean;
@@ -65,6 +72,10 @@ export type ProxyStats = {
   misses: number;
   evictions: number;
   prefetched: number;
+  /** Сколько раз движок сам перечитывал манифест из-за зависшей загрузки. */
+  stallKicks: number;
+  /** Сколько раз origin обрывал тело сегмента (TRUNCATED) — диагностика «залипшего edge». */
+  originTruncated: number;
   maxSessions: number;
 };
 
@@ -91,8 +102,20 @@ export type RestartResult = {
   queued: number;
   /** Плейлист реально перечитан и подменён (структура сегментов не изменилась). */
   refreshed: boolean;
+  /** Изменился ли хоть один URL сегментов — только тогда рестарт реально что-то поменял. */
+  segmentsChanged: boolean;
   cacheable?: boolean;
   reason: string;
+};
+
+/** Движок сам заметил зависшую загрузку и перезапустил манифест (без перемонтажа плеера). */
+export type RecoverEvent = {
+  streamId: string;
+  segmentIndex: number;
+  /** Сколько секунд без прироста байт уже прошло. */
+  waitedSec: number;
+  /** Удалось ли перейти на свежий URL сегмента. */
+  urlChanged: boolean;
 };
 
 export type Subscription = { remove(): void };
@@ -175,3 +198,4 @@ export type NativeMediaProxy = {
   clearCache(streamId?: string): { freedBytes: number };
   addListener(event: string, listener: (payload: unknown) => void): Subscription;
 };
+

@@ -53,6 +53,7 @@ fun main() {
     testEngineLifecycle()
     testEnginePrefetchState()
     testP0Fixes()
+    testRecovery()
     testLivePrewarmAndTtl()
     println()
     println(if (failures == 0) "OK: $checks проверок" else "ПРОВАЛ: $failures из $checks")
@@ -1141,6 +1142,74 @@ private fun testP0Fixes() {
                 engine.setConfig(mapOf("interactiveConcurrency" to 2, "prefetchConcurrency" to 1))
             }.isSuccess,
         )
+    } finally {
+        engine.stop()
+        origin.stop()
+        cleanup(dir)
+    }
+}
+
+// ── восстановление: перезапуск манифеста на уровне прокси (вместо перемонтажа плеера) ────────────
+
+private fun testRecovery() {
+    group("ProxyEngine: восстановление после обрыва")
+    val origin = FixtureOrigin().start()
+    val dir = tempDir()
+    // stallKickSec=1 — чтобы вотчдог успел сработать в пределах теста; prefetchRetries=5 —
+    // чтобы залипшая загрузка жила дольше двух тиков.
+    val engine = newEngine(dir, mapOf("stallKickSec" to 1.0, "prefetchRetries" to 5))
+    val events = mutableListOf<Pair<String, Map<String, Any?>>>()
+    engine.onEvent = { name, payload -> synchronized(events) { events.add(name to payload) } }
+    try {
+        // 1. Сегмент отвалился на «залипшем» edge: прокси сам перечитывает манифест, уходит на
+        //    свежий URL и дотягивает ТОТ ЖЕ клиентский ответ — плееру переспрашивать не нужно.
+        val rot = engine.resolve(origin.rotUrl, ProxyEngine.ResolveOptions("rot|1", emptyMap(), prewarm = false))
+        val rotPlaylist = httpGet(rot.url)
+        eq("rot playlist", 200, rotPlaylist.status)
+        val oldSegment = firstSegment(String(rotPlaylist.body))
+        truth("rot сегмент loopback", oldSegment.startsWith("http://127.0.0.1:"))
+        val body = runCatching { httpGet(oldSegment) }.getOrThrow()
+        eq("тело одним ответом", 200, body.status)
+        eq("длина тела", origin.segmentSize, body.body.size)
+        truth("байты совпали", body.body.contentEquals(origin.segmentBytes))
+        eq("манифест перечитан один раз", 2, origin.hits("rot-playlist"))
+        truth("был запрос на свежий URL", origin.hits("rot-seg2") >= 1)
+
+        // 2. Старый URL после перечитывания по-прежнему адресует тот же сегмент, иначе плеер
+        //    получал бы pass-through мимо кэша (вторая нога правки — карта поколений URL).
+        val beforeHits = origin.hits("rot-seg2")
+        val again = httpGet(oldSegment)
+        eq("старый URL отдаётся", 200, again.status)
+        eq("старый URL целиком", origin.segmentSize, again.body.size)
+        eq("старый URL из кэша", beforeHits, origin.hits("rot-seg2"))
+
+        // 3. Вотчдог: загрузка залипла, URL не меняется — прокси сам кикает, но не больше recoveryMax.
+        val stat = engine.resolve(origin.staticUrl, ProxyEngine.ResolveOptions("static|1", emptyMap(), prewarm = false))
+        val stPlaylist = httpGet(stat.url)
+        eq("static playlist", 200, stPlaylist.status)
+        val stSegment = firstSegment(String(stPlaylist.body))
+        val client = Thread { runCatching { httpGet(stSegment) } }
+        client.isDaemon = true
+        client.start()
+        truth("вотчдог сработал", waitUntil(12_000) { (engine.stats()["stallKicks"] as Long) >= 2 })
+        val kicks = engine.stats()["stallKicks"] as Long
+        eq("киков не больше recoveryMax", 2L, kicks)
+        Thread.sleep(2_500)
+        eq("после бюджета киков нет", kicks, engine.stats()["stallKicks"] as Long)
+        eq("onRecover столько же", kicks.toInt(), synchronized(events) { events.count { it.first == "onRecover" } })
+        client.interrupt()
+
+        // 4. Умерла подпись манифеста: рефреш обязан сообщить в JS, а не молча сдаться.
+        val auth = engine.resolve(origin.authRotUrl, ProxyEngine.ResolveOptions("authrot|1", emptyMap(), prewarm = false))
+        httpGet(auth.url)
+        engine.restart(auth.streamId)
+        truth("onAuthRequired на рефреше", waitUntil(3000) {
+            synchronized(events) { events.any { it.first == "onAuthRequired" && it.second["originStatus"] == 403 } }
+        })
+
+        // 5. Неизвестная сессия — явный отказ, а не тихий no-op (JS по нему сразу перемонтирует).
+        val unknown = engine.restart("nope")
+        truth("restart неизвестной сессии", unknown["reason"] == ProxyErrorCode.SESSION_UNKNOWN.wire)
     } finally {
         engine.stop()
         origin.stop()

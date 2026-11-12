@@ -21,7 +21,7 @@ class MediaProxyModule : Module() {
 
     override fun definition() = ModuleDefinition {
         Name("MediaProxy")
-        Events("onError", "onAuthRequired", "onServerState", "onCache")
+        Events("onError", "onAuthRequired", "onServerState", "onCache", "onRecover")
 
         Function("start") {
             val engine = ensureEngine()

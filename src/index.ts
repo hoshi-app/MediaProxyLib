@@ -7,6 +7,7 @@ import type {
   NativeMediaProxy,
   ProxyErrorEvent,
   ProxyStats,
+  RecoverEvent,
   ResolveOptions,
   ResolveResult,
   RestartResult,
@@ -103,6 +104,8 @@ function normalizeStats(value: unknown): ProxyStats {
     misses: asNumber(raw.misses),
     evictions: asNumber(raw.evictions),
     prefetched: asNumber(raw.prefetched),
+    stallKicks: asNumber(raw.stallKicks),
+    originTruncated: asNumber(raw.originTruncated),
     maxSessions: asNumber(raw.maxSessions),
   };
 }
@@ -211,13 +214,14 @@ export function nudge(streamId: string): { queued: number } {
  */
 export async function restart(streamId: string): Promise<RestartResult> {
   const native = loadNative();
-  const empty: RestartResult = { queued: 0, refreshed: false, reason: 'NO_NATIVE' };
+  const empty: RestartResult = { queued: 0, refreshed: false, segmentsChanged: false, reason: 'NO_NATIVE' };
   if (!native || !streamId) return empty;
   try {
     const raw = asRecord(await native.restartStream(streamId));
     return {
       queued: asNumber(raw.queued),
       refreshed: asBoolean(raw.refreshed),
+      segmentsChanged: asBoolean(raw.segmentsChanged),
       cacheable: asBoolean(raw.cacheable, true),
       reason: asString(raw.reason, 'ok'),
     };
@@ -294,6 +298,10 @@ export const onServerState = (listener: (event: ServerStateEvent) => void): Subs
 export const onCache = (listener: (event: CacheEvent) => void): Subscription =>
   subscribe<CacheEvent>('onCache', listener);
 
+/** Движок сам перечитывает манифест при зависшей загрузке — плееру перемонтироваться не нужно. */
+export const onRecover = (listener: (event: RecoverEvent) => void): Subscription =>
+  subscribe<RecoverEvent>('onRecover', listener);
+
 export type {
   AuthRequiredEvent,
   CacheEvent,
@@ -302,6 +310,7 @@ export type {
   MediaProxyErrorCode,
   ProxyErrorEvent,
   ProxyStats,
+  RecoverEvent,
   ResolveOptions,
   ResolveResult,
   RestartResult,

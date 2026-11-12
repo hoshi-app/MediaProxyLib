@@ -12,7 +12,7 @@ public final class MediaProxyModule: Module {
 
     public func definition() -> ModuleDefinition {
         Name("MediaProxy")
-        Events("onError", "onAuthRequired", "onServerState", "onCache")
+        Events("onError", "onAuthRequired", "onServerState", "onCache", "onRecover")
 
         Function("start") { () -> [String: Any] in
             let engine = self.ensureEngine()

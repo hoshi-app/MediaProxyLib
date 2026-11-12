@@ -38,6 +38,14 @@ class FixtureOrigin {
     val resumeUrl: String get() = "$baseUrl/resume.m3u8"
     val resume2Url: String get() = "$baseUrl/resume2.m3u8"
     val flakyUrl: String get() = "$baseUrl/flaky.m3u8"
+    /** Плейлист, у которого URL сегмента МЕНЯЕТСЯ при каждом перечитывании (?v=N). */
+    val rotUrl: String get() = "$baseUrl/rot.m3u8"
+    /** Плейлист, у которого URL сегмента постоянный, а сегмент висит (для бюджета вотчдога). */
+    val staticUrl: String get() = "$baseUrl/static.m3u8"
+    /** Плейлист отдаётся один раз, затем 403 — умершая подпись (проверка onAuthRequired на рефреше). */
+    val authRotUrl: String get() = "$baseUrl/authrot.m3u8"
+
+    private val rotVersion = AtomicInteger(0)
 
     fun start(): FixtureOrigin {
         server.executor = executor
@@ -174,6 +182,70 @@ class FixtureOrigin {
             path == "/resume2.m3u8" -> {
                 bump("resume2-playlist")
                 send(exchange, 200, "application/vnd.apple.mpegurl", resume2Playlist().toByteArray(), range)
+            }
+            // Перечитывание манифеста меняет URL сегмента: так проверяется «перезапуск манифеста
+            // на уровне прокси» — повтор уходит на свежий URL, и клиент получает тело целиком.
+            path == "/rot.m3u8" -> {
+                bump("rot-playlist")
+                val version = rotVersion.incrementAndGet()
+                val text = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-PLAYLIST-TYPE:VOD\n" +
+                    "#EXTINF:4.000,\n$baseUrl/rot-seg?v=$version\n#EXT-X-ENDLIST\n"
+                send(exchange, 200, "application/vnd.apple.mpegurl", text.toByteArray(), range)
+            }
+            path == "/rot-seg" -> {
+                val version = exchange.requestURI.query?.removePrefix("v=")?.toIntOrNull() ?: 1
+                bump("rot-seg$version")
+                if (version == 1) {
+                    // «Залипший» edge: без Range — 200 с обещанной длиной и обрывом на 400-м байте;
+                    // с Range — честный 206 с правильным Content-Range, но пустым телом.
+                    if (range == null) {
+                        exchange.sendResponseHeaders(200, segmentSize.toLong())
+                        exchange.responseBody.write(segmentBytes, 0, 400)
+                        exchange.responseBody.flush()
+                        exchange.close()
+                    } else {
+                        val start = Http.rangeStart(range)
+                        exchange.responseHeaders.add("Content-Range", "bytes $start-${segmentSize - 1}/$segmentSize")
+                        exchange.responseHeaders.add("Accept-Ranges", "bytes")
+                        exchange.sendResponseHeaders(206, 0)
+                        exchange.close()
+                    }
+                } else {
+                    send(exchange, 200, "video/mp2t", segmentBytes, range)
+                }
+            }
+            path == "/static.m3u8" -> {
+                bump("static-playlist")
+                val text = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-PLAYLIST-TYPE:VOD\n" +
+                    "#EXTINF:4.000,\n$baseUrl/hang\n#EXT-X-ENDLIST\n"
+                send(exchange, 200, "application/vnd.apple.mpegurl", text.toByteArray(), range)
+            }
+            // Тело, которое «капает» и замолкает: загрузка живёт дольше порога вотчдога.
+            path == "/hang" -> {
+                bump("hang")
+                val start = Http.rangeStart(range)
+                if (start > 0) {
+                    exchange.responseHeaders.add("Content-Range", "bytes $start-${segmentSize - 1}/$segmentSize")
+                    exchange.responseHeaders.add("Accept-Ranges", "bytes")
+                }
+                exchange.sendResponseHeaders(if (start > 0) 206 else 200, (segmentSize - start).toLong())
+                if (start == 0L) exchange.responseBody.write(segmentBytes, 0, 100)
+                exchange.responseBody.flush()
+                repeat(60) {
+                    Thread.sleep(100)
+                }
+                exchange.close()
+            }
+            path == "/authrot.m3u8" -> {
+                val n = counters.computeIfAbsent("authrot") { AtomicInteger(0) }.incrementAndGet()
+                if (n == 1) {
+                    val text = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-PLAYLIST-TYPE:VOD\n" +
+                        "#EXTINF:4.000,\n$baseUrl/seg/0.ts?tok=$token\n#EXT-X-ENDLIST\n"
+                    send(exchange, 200, "application/vnd.apple.mpegurl", text.toByteArray(), range)
+                } else {
+                    bump("authrot-403")
+                    send(exchange, 403, "text/plain", "expired".toByteArray(), null)
+                }
             }
             // Рвётся на КАЖДОМ запросе без Range (400 из 1000 байт), а с Range — отдаёт хвост.
             // Так проверяется докачка между запросами плеера, а не только внутри одной загрузки.

@@ -20,6 +20,13 @@ data class ProxyConfig(
     val retryBackoffMs: List<Long> = listOf(500, 1500, 4000),
     val cooldownSec: Double = 30.0,
     val prewarmSegments: Int = 2,
+    /**
+     * Вотчдог зависшей загрузки: сколько секунд без прироста байт ждать до «перезапуска манифеста».
+     * 0 — выключить вотчдог.
+     */
+    val stallKickSec: Double = 6.0,
+    /** Сколько киков допускается на один сегмент, прежде чем движок сдаётся (дальше решает плеер). */
+    val recoveryMax: Int = 2,
     val maxLoopbackConnections: Int = 32,
     val socketIdleSec: Double = 60.0,
     val maxPlaylistBytes: Int = 2 * 1024 * 1024,
@@ -50,6 +57,8 @@ data class ProxyConfig(
         i("prefetchRetries")?.let { c = c.copy(prefetchRetries = it.coerceAtLeast(0)) }
         i("minSpeedKBps")?.let { c = c.copy(prefetchMinSpeedBps = it.coerceAtLeast(0).toLong() * 1024) }
         i("cooldownSec")?.let { c = c.copy(cooldownSec = it.coerceAtLeast(0).toDouble()) }
+        d("stallKickSec")?.let { c = c.copy(stallKickSec = it.coerceAtLeast(0.0)) }
+        i("recoveryMax")?.let { c = c.copy(recoveryMax = it.coerceAtLeast(0)) }
         i("prewarmSegments")?.let { c = c.copy(prewarmSegments = it.coerceAtLeast(0)) }
         i("maxLoopbackConnections")?.let { c = c.copy(maxLoopbackConnections = it.coerceAtLeast(8)) }
         d("socketIdleSec")?.let { c = c.copy(socketIdleSec = it.coerceAtLeast(1.0)) }
@@ -100,6 +109,18 @@ data class TimeoutProfile(
             connectMs = (c.reqConnectSec * 1000).toLong(),
             firstByteMs = 20_000,
             silenceMs = 60_000,
+            minSpeedBps = 0,
+            speedWindowMs = 0,
+        )
+
+        /**
+         * Перечитывание манифеста ради ретрая сегмента: коротко и жёстко. Обычный профиль плейлиста
+         * (20 с) держал бы слот интерактивной загрузки до минуты — а он нужен как раз во время голода.
+         */
+        fun refresh(c: ProxyConfig) = TimeoutProfile(
+            connectMs = (c.reqConnectSec * 1000).toLong(),
+            firstByteMs = 8_000,
+            silenceMs = 15_000,
             minSpeedBps = 0,
             speedWindowMs = 0,
         )

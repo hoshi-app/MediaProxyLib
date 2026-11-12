@@ -22,6 +22,8 @@ export const DEFAULT_CONFIG: MediaProxyConfig = {
   minSpeedKBps: 1,
   cooldownSec: 30,
   prewarmSegments: 2,
+  stallKickSec: 6,
+  recoveryMax: 2,
   serving: 'stream',
   debug: false,
 };

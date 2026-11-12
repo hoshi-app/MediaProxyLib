@@ -174,14 +174,25 @@ class OriginClient(private val config: () -> ProxyConfig) {
         }
     }
 
-    /** Плейлист/ключ: тело небольшое, читаем целиком с лимитом. */
-    fun fetchPlaylist(url: String, headers: Map<String, String>, profile: TimeoutProfile, maxBytes: Int): PlaylistFetch {
+    /**
+     * Плейлист/ключ: тело небольшое, читаем целиком с лимитом.
+     * `callTimeoutMs > 0` — общий потолок запроса (нужен перечитыванию манифеста: оно не должно
+     * держать слот интерактивной загрузки дольше нескольких секунд).
+     */
+    fun fetchPlaylist(
+        url: String,
+        headers: Map<String, String>,
+        profile: TimeoutProfile,
+        maxBytes: Int,
+        callTimeoutMs: Long = 0,
+    ): PlaylistFetch {
         val builder = OkRequest.Builder().url(url)
         applyHeaders(builder, headers)
-        val client = baseClient.newBuilder()
+        val clientBuilder = baseClient.newBuilder()
             .connectTimeout(profile.connectMs, TimeUnit.MILLISECONDS)
             .readTimeout(profile.firstByteMs.coerceAtLeast(1000), TimeUnit.MILLISECONDS)
-            .build()
+        if (callTimeoutMs > 0) clientBuilder.callTimeout(callTimeoutMs, TimeUnit.MILLISECONDS)
+        val client = clientBuilder.build()
         return try {
             client.newCall(builder.build()).execute().use { response ->
                 val cookies = response.headers("Set-Cookie")

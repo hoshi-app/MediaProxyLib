@@ -117,8 +117,10 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
 
     // MARK: - playlist (bounded, синхронно)
 
+    /// `waitSec` — общий потолок ожидания (нужен перечитыванию манифеста: оно не должно держать
+    /// слот интерактивной загрузки дольше нескольких секунд). nil — расчёт по профилю.
     public func fetchPlaylist(url: String, headers: [String: String], profile: TimeoutProfile,
-                              maxBytes: Int) -> (data: Data?, finalUrl: String?, contentType: String?, error: ProxyErrorCode?, cookies: [String]) {
+                              maxBytes: Int, waitSec: Double? = nil) -> (data: Data?, finalUrl: String?, contentType: String?, error: ProxyErrorCode?, cookies: [String]) {
         guard let parsed = URL(string: url) else { return (nil, nil, nil, .invalidUrl, []) }
         var req = URLRequest(url: parsed)
         req.httpMethod = "GET"
@@ -160,7 +162,8 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         }
         task.resume()
         // Таймаут + небольшой запас; при истечении задачу гасим, чтобы не держать соединение.
-        if semaphore.wait(timeout: .now() + Double(max(1, profile.firstByteMs / 1000 + 60))) == .timedOut {
+        let limit = waitSec ?? Double(max(1, profile.firstByteMs / 1000 + 60))
+        if semaphore.wait(timeout: .now() + max(1, limit)) == .timedOut {
             task.cancel()
             return (nil, nil, nil, .timeoutFirstByte, [])
         }

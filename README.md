@@ -75,11 +75,19 @@ const off = MediaProxy.onAuthRequired((e) => {
 // Завис поток посередине серии (плеер голодает, буфер не растёт)? Не перемонтируйте плеер:
 // перезапустите манифест на прокси — он перечитает media-плейлист (у CDN свежие URL сегментов,
 // другой edge/подпись) и заново поставит загрузку залипшего окна. Возврат — Promise.
-const r = await MediaProxy.restart(streamId);   // { queued, refreshed, reason }
+const r = await MediaProxy.restart(streamId);   // { queued, refreshed, segmentsChanged, reason }
+
+// Обычно этого не нужно: движок сам замечает «клиент просит, а байты не идут» (stallKickSec)
+// и перезапускает манифест без участия JS. Событие — для логов и метрик, не для ремонта.
+MediaProxy.onRecover((e) => {
+  // e = { streamId, segmentIndex, waitedSec, urlChanged }
+});
 ```
 
 Методы: `start`, `resolve`, `release`, `failOpen`, `nudge`, `restart`, `setConfig`, `getStats`,
-`getStreamState`, `clearCache`; события: `onError`, `onAuthRequired`, `onServerState`, `onCache`.
+`getStreamState`, `clearCache`; события: `onError`, `onAuthRequired`, `onServerState`, `onCache`,
+`onRecover`. В `getStats()` — `stallKicks` (сколько раз движок перечитывал манифест сам) и
+`originTruncated` (сколько обрывов тела отдал origin: диагностика «залипшего edge»).
 Плейлисты, Range, prefetch, лимит кэша и вытеснение — нативно; JS только задаёт политику и
 разбирает ошибки.
 

@@ -21,6 +21,11 @@ public struct ProxyConfig {
     public var retryBackoffMs: [Int64] = [500, 1500, 4000]
     public var cooldownSec: Double = 30
     public var prewarmSegments: Int = 2
+    /// Вотчдог зависшей загрузки: сколько секунд без прироста байт ждать до «перезапуска манифеста».
+    /// 0 — выключить вотчдог.
+    public var stallKickSec: Double = 6
+    /// Сколько киков допускается на один сегмент, прежде чем движок сдаётся (дальше решает плеер).
+    public var recoveryMax: Int = 2
     public var maxLoopbackConnections: Int = 32
     public var socketIdleSec: Double = 60
     public var maxPlaylistBytes: Int = 2 * 1024 * 1024
@@ -59,6 +64,8 @@ public struct ProxyConfig {
         if let v = i("prefetchRetries") { prefetchRetries = max(0, v) }
         if let v = i("minSpeedKBps") { prefetchMinSpeedBps = Int64(max(0, v)) * 1024 }
         if let v = i("cooldownSec") { cooldownSec = max(0, Double(v)) }
+        if let v = d("stallKickSec") { stallKickSec = max(0, v) }
+        if let v = i("recoveryMax") { recoveryMax = max(0, v) }
         if let v = i("prewarmSegments") { prewarmSegments = max(0, v) }
         if let v = i("maxLoopbackConnections") { maxLoopbackConnections = max(8, v) }
         if let v = d("socketIdleSec") { socketIdleSec = max(1, v) }
@@ -99,6 +106,16 @@ public struct TimeoutProfile {
         TimeoutProfile(connectMs: Int64(c.reqConnectSec * 1000),
                        firstByteMs: 20000,
                        silenceMs: 60000,
+                       minSpeedBps: 0,
+                       speedWindowMs: 0)
+    }
+
+    /// Перечитывание манифеста ради ретрая сегмента: коротко и жёстко. Профиль плейлиста (20 с)
+    /// держал бы слот интерактивной загрузки до минуты — а он нужен как раз во время голода.
+    public static func refresh(_ c: ProxyConfig) -> TimeoutProfile {
+        TimeoutProfile(connectMs: Int64(c.reqConnectSec * 1000),
+                       firstByteMs: 8000,
+                       silenceMs: 15000,
                        minSpeedBps: 0,
                        speedWindowMs: 0)
     }

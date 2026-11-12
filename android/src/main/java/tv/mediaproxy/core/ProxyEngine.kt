@@ -57,7 +57,34 @@ class ProxyEngine(private val root: File) {
         @Volatile var stale: Boolean = false
         @Volatile var authNotified: Boolean = false
         /** Когда последний раз перечитывали media-плейлист ради ретрая сегмента (анти-шторм). */
-        @Volatile var refreshedAt: Long = 0L
+        @Volatile var playlistRefreshedAt: Long = 0L
+        /** Когда клиент (плеер) последний раз просил ресурс через прокси — гейт вотчдога. */
+        @Volatile var lastClientRequestAt: Long = nowMs()
+        /** Сегменты, по которым кики уже не помогли: больше не тратим трафик до прогресса. */
+        val recoveriesGaveUp = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+
+        /**
+         * Поколения карт «URL сегмента → индекс». После перечитывания манифеста URL меняются, а плеер
+         * продолжает просить СТАРЫЕ (свой плейлист он не перезапрашивает). Без этого кольца такие
+         * запросы уходили бы в pass-through, и кэш тихо переставал работать.
+         */
+        private val indexGenerations = java.util.Collections.synchronizedList(ArrayList<Map<String, Int>>())
+
+        fun pushIndexMap(map: Map<String, Int>) {
+            synchronized(indexGenerations) {
+                indexGenerations.add(0, map)
+                while (indexGenerations.size > 3) indexGenerations.removeAt(indexGenerations.size - 1)
+            }
+        }
+
+        /** Сначала текущий плейлист, затем старые поколения (R1: не наоборот). */
+        fun indexOf(url: String): Int? {
+            activeMedia?.indexByUrl?.get(url)?.let { return it }
+            synchronized(indexGenerations) {
+                for (map in indexGenerations) map[url]?.let { return it }
+            }
+            return null
+        }
     }
 
     class PlaylistResource(
@@ -118,6 +145,22 @@ class ProxyEngine(private val root: File) {
     private val hits = AtomicLong(0)
     private val misses = AtomicLong(0)
     private val prefetchedCount = AtomicLong(0)
+    private val stallKicks = AtomicLong(0)
+    private val originTruncated = AtomicLong(0)
+
+    /**
+     * Наблюдение за прогрессом КЛИЕНТСКИХ загрузок для вотчдога: когда байты перестали расти.
+     * Живёт отдельно от `Download`, чтобы не трогать горячие пути; чистится вместе с загрузкой.
+     */
+    private class Progress(val written: Long, val at: Long) {
+        var last: Long = written
+        var lastAt: Long = at
+        var kicks: Int = 0
+        var baseline: Long = written
+    }
+
+    private val downloadProgress = HashMap<String, Progress>()
+    private var recoverWatchdog: java.util.concurrent.ScheduledExecutorService? = null
 
     /** События в JS: onError, onAuthRequired, onServerState, onCache. */
     var onEvent: ((name: String, payload: Map<String, Any?>) -> Unit)? = null
@@ -150,6 +193,7 @@ class ProxyEngine(private val root: File) {
             generation++
             ensurePools()
             resizePools()
+            startRecoverWatchdog()
             emit(
                 "onServerState",
                 mapOf("running" to true, "port" to http.boundPort, "baseUrl" to baseUrl,
@@ -169,6 +213,8 @@ class ProxyEngine(private val root: File) {
 
     fun stop() {
         running = false
+        recoverWatchdog?.shutdownNow()
+        recoverWatchdog = null
         server?.stop()
         server = null
         synchronized(downloadsLock) {
@@ -326,15 +372,100 @@ class ProxyEngine(private val root: File) {
     /**
      * «Перезапуск манифеста» по просьбе JS (сторож плеера): перечитываем media-плейлист и заново
      * ставим загрузку залипшего окна. Плеер при этом НЕ перемонтируется — это и есть цель.
+     * `segmentsChanged` — изменился ли хоть один URL сегментов (иначе рестарт был формальностью).
      */
     fun restart(streamId: String): Map<String, Any?> {
         val session = sessions[streamId]
-            ?: return mapOf("queued" to 0, "refreshed" to false, "reason" to ProxyErrorCode.SESSION_UNKNOWN.wire)
-        val refreshed = refreshMedia(session)
+            ?: return mapOf("queued" to 0, "refreshed" to false, "segmentsChanged" to false,
+                            "reason" to ProxyErrorCode.SESSION_UNKNOWN.wire)
+        val outcome = refreshMedia(session)
         val queued = nudge(streamId)["queued"] ?: 0
-        Log.line("restart", "sid=$streamId refreshed=$refreshed queued=$queued")
-        return mapOf("queued" to queued, "refreshed" to refreshed,
-                     "cacheable" to session.cacheable, "reason" to if (refreshed) "ok" else "unchanged")
+        Log.line("restart", "sid=$streamId refreshed=${outcome.performed} " +
+            "changed=${outcome.segmentsChanged} queued=$queued")
+        val reason = when {
+            !outcome.performed -> "unchanged"
+            outcome.segmentsChanged -> "ok"
+            else -> "same-urls"
+        }
+        return mapOf("queued" to queued, "refreshed" to outcome.performed,
+                     "segmentsChanged" to outcome.segmentsChanged,
+                     "cacheable" to session.cacheable, "reason" to reason)
+    }
+
+    // MARK: - вотчдог зависшей загрузки
+
+    private fun startRecoverWatchdog() {
+        recoverWatchdog?.shutdownNow()
+        val pool = Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "mediaproxy-recover").apply { isDaemon = true }
+        }
+        pool.scheduleWithFixedDelay({ runCatching { recoverTick() } }, 2, 2, TimeUnit.SECONDS)
+        recoverWatchdog = pool
+    }
+
+    /**
+     * Прокси сам замечает «клиент просит, а байты не идут» и перечитывает манифест — плееру для
+     * этого перемонтироваться не нужно. Гейты: только клиентские загрузки, только сессии с живым
+     * клиентом, только после cfg.stallKickSec тишины, не больше cfg.recoveryMax киков на сегмент.
+     */
+    private fun recoverTick() {
+        val cfg = config
+        if (!running || cfg.stallKickSec <= 0 || cfg.recoveryMax <= 0) return
+        val now = nowMs()
+        val stalled = mutableListOf<Download>()
+        synchronized(downloadsLock) {
+            val iterator = downloads.entries.iterator()
+            while (iterator.hasNext()) {
+                val (key, download) = iterator.next()
+                if (download.isPrefetch) continue
+                val progress = downloadProgress.getOrPut(key) { Progress(download.feed.written, now) }
+                val written = download.feed.written
+                if (written > progress.last) {
+                    progress.last = written
+                    progress.lastAt = now
+                }
+                val session = download.session
+                if (session.stale) continue
+                // Клиент ушёл (пауза/фон/перемонт) — лечить нечего и незачем.
+                if (now - session.lastClientRequestAt > 15_000L) continue
+                if (now - progress.lastAt < (cfg.stallKickSec * 1000).toLong()) continue
+                if (progress.kicks >= cfg.recoveryMax) {
+                    // Все кики без прогресса — сегмент мёртв, дальше решает плеер.
+                    if (progress.last <= progress.baseline) session.recoveriesGaveUp.add(download.segment.index)
+                    continue
+                }
+                stalled.add(download)
+            }
+        }
+        // Сетевой рефреш — ВНЕ замка загрузок.
+        for (download in stalled) kickStalled(download, now)
+    }
+
+    private fun kickStalled(download: Download, now: Long) {
+        val session = download.session
+        val index = download.segment.index
+        val outcome = refreshMedia(session)
+        val fresh = currentSegmentUrl(session, index)
+        val urlChanged = fresh != null && fresh != download.url
+        if (urlChanged) download.url = fresh!!
+        val progress = synchronized(downloadsLock) { downloadProgress[download.key] } ?: return
+        val waited = (now - progress.lastAt) / 1000.0
+        progress.kicks += 1
+        // Следующий кик — не раньше чем через stallKickSec: рефреш уже мог занять время.
+        progress.lastAt = now
+        if (progress.kicks == 1) progress.baseline = progress.last
+        stallKicks.incrementAndGet()
+        Log.line("recover", "sid=${session.id} seg=$index waited=${waited}s " +
+            "changed=${outcome.segmentsChanged} urlChanged=$urlChanged kick=${progress.kicks}")
+        emit(
+            "onRecover",
+            mapOf(
+                "streamId" to session.id,
+                "segmentIndex" to index,
+                "waitedSec" to waited,
+                "urlChanged" to urlChanged,
+            ),
+        )
     }
 
     // MARK: - HTTP routing
@@ -345,6 +476,8 @@ class ProxyEngine(private val root: File) {
         val session = sessions[parts[1]]
             ?: return HttpReply.text(410, ProxyErrorCode.SESSION_UNKNOWN.wire)
         session.lastAccess = nowMs()
+        // Метка «клиент ещё жив»: вотчдог не лечит сессии, к которым никто не обращается.
+        session.lastClientRequestAt = nowMs()
         val absolute = B64Url.decode(parts[2])
             ?: return HttpReply.text(400, ProxyErrorCode.INVALID_URL.wire)
         if (session.stale) return HttpReply.text(410, "stale")
@@ -397,6 +530,9 @@ class ProxyEngine(private val root: File) {
 
         if (rewritten.kind == PlaylistKind.MEDIA) {
             session.activeMedia = resource
+            // Плеер запомнил URL из ЭТОГО плейлиста: после будущих перечитываний они должны
+            // по-прежнему адресовать тот же индекс (иначе кэш тихо превращается в pass-through).
+            session.pushIndexMap(resource.indexByUrl)
             if (!rewritten.cacheable) {
                 session.cacheable = false
                 Log.line("playlist", "без кэша: ${rewritten.reason} $url")
@@ -422,27 +558,37 @@ class ProxyEngine(private val root: File) {
     private fun playlistTtlMs(resource: PlaylistResource): Long =
         maxOf((resource.result.media.targetDuration * 1000).toLong(), 2_000L)
 
+    /** Итог перечитывания манифеста: сделан ли рефреш и сменились ли хоть какие-то URL сегментов. */
+    private data class RefreshOutcome(val performed: Boolean, val segmentsChanged: Boolean)
+
     /**
      * «Перезапуск манифеста» на уровне прокси: перечитываем media-плейлист и, если структура
      * сегментов та же (одинаковый fingerprint — кэш остаётся валидным), подменяем его свежей копией.
-     * Зачем: сегментный хост/подпись у CDN «залипают» на минуты, а свежий запрос плейлиста отдаёт
-     * актуальные URL. Так повтор сегмента уходит на живой edge, и плееру не нужно перемонтироваться.
+     * Зачем: подпись/хост сегментов у CDN устаревают, а свежий запрос плейлиста отдаёт актуальные
+     * URL. Так повтор сегмента уходит на живой edge, и плееру не нужно перемонтироваться.
      */
-    private fun refreshMedia(session: Session): Boolean {
-        val current = session.activeMedia ?: return false
+    private fun refreshMedia(session: Session): RefreshOutcome {
+        val current = session.activeMedia ?: return RefreshOutcome(false, false)
         // Шторм ретраев не должен превращаться в шторм запросов плейлиста.
         synchronized(session.lock) {
-            if (nowMs() - session.refreshedAt < 5_000L) return false
-            session.refreshedAt = nowMs()
+            if (nowMs() - session.playlistRefreshedAt < 5_000L) return RefreshOutcome(false, false)
+            session.playlistRefreshedAt = nowMs()
         }
         val cfg = config
         val url = current.originUrl
-        val fetched = origin.fetchPlaylist(url, headersFor(session, url), TimeoutProfile.playlist(cfg), cfg.maxPlaylistBytes)
+        val profile = TimeoutProfile.refresh(cfg)
+        // Жёсткий потолок запроса: рефреш идёт внутри полосы голода, слот загрузки держать нельзя.
+        val fetched = origin.fetchPlaylist(
+            url, headersFor(session, url), profile, cfg.maxPlaylistBytes,
+            callTimeoutMs = profile.firstByteMs + 5_000,
+        )
         mergeCookies(session, url, fetched.setCookies)
         val data = fetched.data
         if (fetched.error != null || data == null || !PlaylistRewriter.looksLikePlaylist(data)) {
             Log.line("refresh", "плейлист не перечитан: ${fetched.error?.wire ?: "не плейлист"} $url")
-            return false
+            // 401/403/410 — умерла подпись, а не сегмент: JS обязан узнать (fail-open/перерезолв).
+            fetched.error?.takeIf { it.auth }?.let { notifyError(session, url, it, 1) }
+            return RefreshOutcome(false, false)
         }
         val text = String(data, Charsets.UTF_8)
         val finalUrl = fetched.finalUrl ?: url
@@ -453,12 +599,14 @@ class ProxyEngine(private val root: File) {
         // станет мусором, а ensureStream снесёт каталог прямо во время игры.
         if (rewritten.kind != PlaylistKind.MEDIA || rewritten.fingerprint != current.result.fingerprint) {
             Log.line("refresh", "структура сегментов изменилась (${rewritten.reason}) — остаёмся на старом")
-            return false
+            return RefreshOutcome(true, false)
         }
+        val changed = segmentsChanged(current, rewritten)
         val resource = PlaylistResource(url, finalUrl, rewritten.text, rewritten)
         session.playlists[url] = resource
         session.playlists[finalUrl] = resource
         session.activeMedia = resource
+        session.pushIndexMap(resource.indexByUrl)
         // Наш же prefetch считает неудачные сегменты «мёртвыми» на cooldownSec: после смены
         // манифеста кулдаун надо снять, иначе окно впереди так и не перезакачается.
         val stream = session.stream
@@ -469,8 +617,20 @@ class ProxyEngine(private val root: File) {
                 for (index in last..end) cache.update(stream, index) { it.failedUntil = 0 }
             }
         }
-        Log.line("refresh", "манифест перезапущен: сегментов ${rewritten.media.segments.size} $url")
-        return true
+        Log.line("refresh", "манифест перезапущен: сегментов ${rewritten.media.segments.size} " +
+            "changed=$changed $url")
+        return RefreshOutcome(true, changed)
+    }
+
+    /** Сравниваем URL по индексу: подпись или хост в query могли обновиться. */
+    private fun segmentsChanged(current: PlaylistResource, fresh: RewriteResult): Boolean {
+        val before = current.result.media.segments
+        val after = fresh.media.segments
+        if (before.size != after.size) return true
+        for (i in after.indices) {
+            if (before[i].url != after[i].url) return true
+        }
+        return false
     }
 
     private fun playlistReply(resource: PlaylistResource): HttpReply = HttpReply(
@@ -488,15 +648,20 @@ class ProxyEngine(private val root: File) {
         if (!session.cacheable || media == null || stream == null) {
             return passThrough(session, url, range, cacheable = false)
         }
-        val index = media.indexByUrl[url] ?: return passThrough(session, url, range, cacheable = false)
+        // Индекс ищем по карте поколений: после перечитывания манифеста URL другие, а плеер
+        // продолжает просить старые — без этого он получал бы pass-through мимо кэша.
+        val index = session.indexOf(url) ?: return passThrough(session, url, range, cacheable = false)
         synchronized(session.lock) {
             if (index > session.lastSegmentIndex) session.lastSegmentIndex = index
         }
-        val segment = media.result.media.segments.getOrNull(index) ?: return passThrough(session, url, range, false)
+        val segment = media.result.media.segments.firstOrNull { it.index == index }
+            ?: return passThrough(session, url, range, false)
         var entry = cache.ensureEntry(stream, index, nowMs())
 
         if (entry.complete) {
             hits.incrementAndGet()
+            // Сегмент докачался — кики по нему больше не нужны (новый сбой начнёт счёт заново).
+            session.recoveriesGaveUp.remove(index)
             val type = entry.contentType ?: Http.contentType(extensionOf(url))
             return HttpReply(
                 status = 200,
@@ -600,6 +765,7 @@ class ProxyEngine(private val root: File) {
             val feed = openFeed(stream, segment.index)
             val download = Download(key, session, stream, segment, feed, isPrefetch = false, url = segment.url)
             downloads[key] = download
+            downloadProgress[key] = Progress(feed.written, nowMs())
             cache.retain(stream)
             cache.update(stream, segment.index) {
                 it.downloading = true
@@ -641,6 +807,16 @@ class ProxyEngine(private val root: File) {
                 return
             }
             while (!download.cancelled.get()) {
+                // Свежий URL (после перечитывания манифеста — своим ретраем или вотчдогом) обязан
+                // подхватываться этой же загрузкой: иначе клиентский ответ придётся рвать, а серия
+                // уйдёт в перемонт. Склейку префикса страхует проверка Content-Range в OriginClient
+                // (206 с чужим start → RANGE_UNSUPPORTED) и If-Range, когда есть ETag.
+                currentSegmentUrl(download.session, index)?.let { fresh ->
+                    if (fresh != download.url) {
+                        Log.line("retry", "сегмент $index → свежий URL")
+                        download.url = fresh
+                    }
+                }
                 val start = download.feed.written
                 val ifRange = if (start > 0) {
                     download.feed.etag ?: cache.entry(download.stream, index)?.etag
@@ -659,6 +835,7 @@ class ProxyEngine(private val root: File) {
                 val result = origin.download(request, download.feed)
                 mergeCookies(download.session, download.url, result.setCookies)
                 val code = result.code
+                if (code == ProxyErrorCode.TRUNCATED) originTruncated.incrementAndGet()
 
                 if (code == null) {
                     val total = download.feed.total
@@ -707,15 +884,19 @@ class ProxyEngine(private val root: File) {
                 // Правило «ретраит плеер, а не мы» в силе для первого облома: один запрос плеера =
                 // один запрос к origin. Но если мы уже повторили и снова облом — виноват не поток,
                 // а конкретный сегментный edge. Перечитываем манифест ЗДЕСЬ, в прокси (свежие URL
-                // сегментов), и повторяем: плееру перемонтироваться не нужно.
-                if (code.retryable && attempt >= 2 && !download.refreshed && !download.cancelled.get() &&
+                // сегментов), и повторяем: плееру перемонтироваться не нужно. Условие перехода на
+                // новый URL — смена URL, а не факт «кто-то перечитал плейлист» (иначе анти-шторм
+                // вотчдога глушил бы собственный ретрай загрузки).
+                if (code.retryable && attempt >= 2 && !download.refreshed && !download.cancelled.get()) {
                     refreshMedia(download.session)
-                ) {
-                    download.refreshed = true
-                    currentSegmentUrl(download.session, index)?.let { download.url = it }
-                    attempt = 0
-                    Log.line("retry", "сегмент $index → ${download.url}")
-                    continue
+                    val fresh = currentSegmentUrl(download.session, index)
+                    if (fresh != null && fresh != download.url) {
+                        download.refreshed = true
+                        download.url = fresh
+                        attempt = 0
+                        Log.line("retry", "сегмент $index → $fresh")
+                        continue
+                    }
                 }
 
                 val written = download.feed.written
@@ -738,7 +919,10 @@ class ProxyEngine(private val root: File) {
             synchronized(downloadsLock) {
                 // Только свою запись: пока мы падали (feed.fail уже виден читателям), под этим же
                 // ключом могла стартовать новая загрузка — её снимать нельзя.
-                if (downloads[download.key] === download) downloads.remove(download.key)
+                if (downloads[download.key] === download) {
+                    downloads.remove(download.key)
+                    downloadProgress.remove(download.key)
+                }
             }
             cache.release(download.stream)
         }
@@ -792,6 +976,7 @@ class ProxyEngine(private val root: File) {
             val feed = openFeed(stream, segment.index)
             val download = Download(key, session, stream, segment, feed, isPrefetch = true, url = segment.url)
             downloads[key] = download
+            downloadProgress[key] = Progress(feed.written, nowMs())
             cache.retain(stream)
             // У prefetch нет «запроса плеера», который создал бы запись: без ensureEntry update ниже
             // молча ничего не делает, и сегмент скачан, но кэш о нём не знает.
@@ -833,6 +1018,8 @@ class ProxyEngine(private val root: File) {
         "misses" to misses.get(),
         "evictions" to cache.evictedCount(),
         "prefetched" to prefetchedCount.get(),
+        "stallKicks" to stallKicks.get(),
+        "originTruncated" to originTruncated.get(),
         "maxSessions" to config.maxSessions,
     )
 
