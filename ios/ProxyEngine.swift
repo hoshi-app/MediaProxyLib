@@ -39,6 +39,8 @@ public final class ProxyEngine {
         var streamRefHeld = false
         var stale = false
         var authNotified = false
+        /// Когда последний раз перечитывали media-плейлист ради ретрая сегмента (анти-шторм).
+        var refreshedAt: TimeInterval = 0
         /// Per-session cookie jar: host → name → value (§6.1). Никакого HTTPCookieStorage.
         var cookies: [String: [String: String]] = [:]
         /// Один лок на изменяемое состояние сессии: запросы плейлиста/сегментов идут с разных потоков.
@@ -89,15 +91,23 @@ public final class ProxyEngine {
         var attempts = 0
         var cancelled = false
         var lastError: ProxyErrorCode?
+        /// Текущий URL сегмента. Меняется после «перезапуска манифеста»: повтор обязан уйти на свежий
+        /// URL (другой edge/подпись), а не в тот, который уже отвалился.
+        var url: String
+        /// Перечитывали ли плейлист ради этого сегмента: одна такая попытка на загрузку.
+        var refreshed = false
+
+        var index: Int { segment?.index ?? 0 }
 
         init(key: String, session: Session, stream: CacheStore.Stream, segment: PlaylistSegment?,
-             feed: ByteFeed, isPrefetch: Bool) {
+             feed: ByteFeed, isPrefetch: Bool, url: String) {
             self.key = key
             self.session = session
             self.stream = stream
             self.segment = segment
             self.feed = feed
             self.isPrefetch = isPrefetch
+            self.url = url
         }
     }
 
@@ -120,7 +130,6 @@ public final class ProxyEngine {
     private var generation = 0
     private var sessions: [String: Session] = [:]
     private var downloads: [String: Download] = [:]
-    private var prefetched: Set<String> = []
     private var countersLock = NSLock()
     private var hits = 0
     private var misses = 0
@@ -280,7 +289,6 @@ public final class ProxyEngine {
             d.cancelled = true
             downloads.removeValue(forKey: key)
         }
-        prefetched = prefetched.filter { !$0.hasPrefix(session.cacheKey + "|") }
         downloadsLock.unlock()
     }
 
@@ -300,14 +308,29 @@ public final class ProxyEngine {
         return nil
     }
 
+    /// «Догрузи вперёд» для сторожа плеера. Отсчёт — от ПОСЛЕДНЕГО ЗАПРОШЕННОГО сегмента включительно:
+    /// залип обычно именно он, а не следующий за ним. `force` — снять кулдаун неудачных сегментов.
     public func nudge(_ streamId: String) -> [String: Any] {
         guard let session = sessionById(streamId), session.cacheable else { return ["queued": 0] }
         return session.lock.withLock { () -> [String: Any] in
             guard let media = session.activeMedia, let stream = session.stream else { return ["queued": 0] }
-            let from = max(0, session.lastSegmentIndex)
-            let queued = schedulePrefetch(session: session, stream: stream, resource: media, from: from)
+            let from = max(0, session.lastSegmentIndex) - 1
+            let queued = schedulePrefetch(session: session, stream: stream, resource: media, from: from, force: true)
             return ["queued": queued]
         }
+    }
+
+    /// «Перезапуск манифеста» по просьбе JS (сторож плеера): перечитываем media-плейлист и ставим
+    /// заново загрузку залипшего окна. Плеер при этом НЕ перемонтируется — это и есть цель.
+    public func restart(_ streamId: String) -> [String: Any] {
+        guard let session = sessionById(streamId) else {
+            return ["queued": 0, "refreshed": false, "reason": ProxyErrorCode.sessionUnknown.rawValue]
+        }
+        let refreshed = refreshMedia(session: session)
+        let nudgeResult = nudge(streamId)
+        Log.line("restart", "sid=\(streamId) refreshed=\(refreshed) queued=\(nudgeResult["queued"] ?? 0)")
+        return ["queued": nudgeResult["queued"] ?? 0, "refreshed": refreshed,
+                "cacheable": session.cacheable, "reason": refreshed ? "ok" : "unchanged"]
     }
 
     // MARK: - HTTP routing
@@ -398,6 +421,65 @@ public final class ProxyEngine {
         max(resource.result.media.targetDuration, 2)
     }
 
+    /// «Перезапуск манифеста» на уровне прокси: перечитываем media-плейлист и, если структура
+    /// сегментов та же (одинаковый fingerprint — кэш остаётся валидным), подменяем его свежей копией.
+    /// Зачем: сегментный хост/подпись у CDN «залипают» на минуты, а новый запрос плейлиста отдаёт
+    /// актуальные URL. Так повтор сегмента уходит на живой edge, и плееру не нужно перемонтироваться.
+    @discardableResult
+    private func refreshMedia(session: Session) -> Bool {
+        guard let current = session.lock.withLock({ session.activeMedia }) else { return false }
+        let now = Date().timeIntervalSince1970
+        // Шторм ретраев не должен превращаться в шторм запросов плейлиста.
+        let busy = session.lock.withLock { () -> Bool in
+            if now - session.refreshedAt < 5 { return true }
+            session.refreshedAt = now
+            return false
+        }
+        if busy { return false }
+
+        let cfg = config
+        let url = current.originUrl
+        let result = origin.fetchPlaylist(url: url, headers: headersFor(session: session, url: url),
+                                          profile: .playlist(cfg), maxBytes: cfg.maxPlaylistBytes)
+        mergeCookies(session: session, url: url, setCookies: result.cookies)
+        guard result.error == nil, let data = result.data, PlaylistRewriter.looksLikePlaylist(data) else {
+            Log.line("refresh", "плейлист не перечитан: \(result.error?.rawValue ?? "не плейлист") \(url)")
+            return false
+        }
+        let text = String(decoding: data, as: UTF8.self)
+        let finalUrl = result.finalUrl ?? url
+        let rewritten = PlaylistRewriter.rewrite(text: text, finalUrl: finalUrl) { [weak self] absolute, kind in
+            guard let self, let server = self.server else { return absolute }
+            return self.proxyUrl(session: session, absolute: absolute, kind: kind, port: server.boundPort)
+        }
+        // Другая структура — это уже другой контент: подменять плейлист нельзя, иначе кэш сегментов
+        // станет мусором, а `ensureStreamLocked` снесёт каталог прямо во время игры.
+        guard rewritten.kind == .media, rewritten.fingerprint == current.result.fingerprint else {
+            Log.line("refresh", "структура сегментов изменилась (\(rewritten.reason)) — остаёмся на старом")
+            return false
+        }
+        let resource = PlaylistResource(originUrl: url, finalUrl: finalUrl, text: rewritten.text, result: rewritten)
+        let stream = session.lock.withLock { () -> CacheStore.Stream? in
+            session.playlists[url] = resource
+            session.playlists[finalUrl] = resource
+            session.activeMedia = resource
+            return session.stream
+        }
+        // Наш же prefetch считает неудачные сегменты «мёртвыми» на `cooldownSec`: после смены
+        // манифеста кулдаун надо снять, иначе окно впереди так и не перезакачается.
+        if let stream {
+            let last = max(0, session.lastSegmentIndex)
+            let end = min(rewritten.media.segments.count - 1, last + max(1, cfg.prefetchMaxSegments))
+            if end >= last {
+                for index in last...end {
+                    cache.update(stream, index: index) { $0.failedUntil = 0 }
+                }
+            }
+        }
+        Log.line("refresh", "манифест перезапущен: сегментов \(rewritten.media.segments.count) \(url)")
+        return true
+    }
+
     private func playlistReply(_ resource: PlaylistResource, range: String?) -> HttpReply {
         HttpReply(status: 200,
                   headers: ["Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-store"],
@@ -425,7 +507,10 @@ public final class ProxyEngine {
                              body: FileBody(url: entry.file), length: entry.prefix)
         }
         if entry.failedUntil > Date().timeIntervalSince1970 {
-            return errorReply(.budgetExhausted)
+            // Кулдаун — ограничение ТОЛЬКО для prefetch. Запросу плеера отдаём повтор: 502 на 30 с
+            // «мёртвого» сегмента плеер воспринимал как отказ источника и перемонтировал поток
+            // (лог 12.11: `[mp] error TRUNCATED` → 502 → `stream reload` при живом кэше).
+            cache.update(stream, index: index) { $0.failedUntil = 0 }
         }
         if !cache.evictIfNeeded(required: 0, protecting: [session.cacheKey], now: Date().timeIntervalSince1970) {
             return passThrough(session: session, url: url, range: range, cacheState: "passthrough")
@@ -507,7 +592,10 @@ public final class ProxyEngine {
                                 segment: PlaylistSegment?, profile: TimeoutProfile) -> ByteFeed? {
         let key = "\(stream.key)#\(index)"
         downloadsLock.lock()
-        if let existing = downloads[key] {
+        // Живая загрузка отдаётся как есть. Уже УПАВШАЯ (feed с ошибкой), но ещё не снятая с учёта,
+        // не отдаётся: иначе повторный запрос плеера мгновенно получает тот же отказ, ни разу не
+        // сходив в origin («запрос плеера сходил в origin» в SelfTest).
+        if let existing = downloads[key], existing.feed.error == nil {
             downloadsLock.unlock()
             return existing.feed
         }
@@ -518,7 +606,8 @@ public final class ProxyEngine {
         }
         let feed = openFeed(stream, index)
         let download = Download(key: key, session: session, stream: stream, segment: segment,
-                                feed: feed, isPrefetch: false)
+                                feed: feed, isPrefetch: false,
+                                url: segment?.url ?? session.originUrl)
         downloads[key] = download
         downloadsLock.unlock()
         cache.retain(stream)
@@ -569,9 +658,8 @@ public final class ProxyEngine {
                 var terminal: ProxyErrorCode? = nil
                 var receivedCookies: [String] = []
 
-                origin.open(OriginClient.Request(url: download.segment?.url ?? sessionOrigin(download),
-                                                 headers: headersFor(session: download.session,
-                                                                     url: download.segment?.url ?? download.session.originUrl),
+                origin.open(OriginClient.Request(url: download.url,
+                                                 headers: headersFor(session: download.session, url: download.url),
                                                  rangeStart: start,
                                                  ifRange: ifRange,
                                                  profile: profile,
@@ -583,9 +671,7 @@ public final class ProxyEngine {
                     semaphore.signal()
                 }
                 _ = semaphore.wait(timeout: .now() + 300)
-                mergeCookies(session: download.session,
-                             url: download.segment?.url ?? download.session.originUrl,
-                             setCookies: receivedCookies)
+                mergeCookies(session: download.session, url: download.url, setCookies: receivedCookies)
 
                 if terminal == nil {
                     let total = download.feed.total
@@ -615,18 +701,31 @@ public final class ProxyEngine {
                     cache.update(download.stream, index: index) { e in
                         e.total = -1; e.prefix = 0; e.complete = false; e.downloading = false; e.etag = nil
                     }
-                    notifyError(session: download.session, url: download.segment?.url ?? "", code: code,
+                    notifyError(session: download.session, url: download.url, code: code,
                                 attempt: attempt + 1, originStatus: nil)
                     finishDownload(download, error: code)
                     return
                 }
 
                 attempt += 1
-                // Ретраит плеер, а не мы: нативные повторы только для prefetch и продолжений.
                 let mayRetry = download.isPrefetch || start > 0 || download.feed.written > start
                 if code.isRetryable && mayRetry && attempt <= cfg.prefetchRetries && !download.cancelled {
                     let backoff = cfg.retryBackoffMs[min(attempt - 1, cfg.retryBackoffMs.count - 1)]
                     Thread.sleep(forTimeInterval: Double(backoff) / 1000)
+                    continue
+                }
+
+                // Правило «ретраит плеер, а не мы» в силе для первого облома: один запрос плеера =
+                // один запрос к origin. Но если мы уже повторили и снова облом — виноват не поток,
+                // а конкретный сегментный edge. Перечитываем манифест ЗДЕСЬ, в прокси (свежие URL
+                // сегментов), и повторяем: плееру перемонтироваться не нужно (лог 12.11: TRUNCATED
+                // с `apollo.cloud2…` → перемонт → fail-open, хотя соседний edge отдавал тот же файл).
+                if code.isRetryable, attempt >= 2, !download.refreshed, !download.cancelled,
+                   refreshMedia(session: download.session) {
+                    download.refreshed = true
+                    download.url = currentUrl(session: download.session, index: index) ?? download.url
+                    attempt = 0
+                    Log.line("retry", "сегмент \(index) → \(download.url)")
                     continue
                 }
 
@@ -643,7 +742,7 @@ public final class ProxyEngine {
                     e.feed = download.feed
                     e.etag = download.feed.etagValue
                 }
-                notifyError(session: download.session, url: download.segment?.url ?? "", code: code,
+                notifyError(session: download.session, url: download.url, code: code,
                             attempt: attempt, originStatus: nil)
                 finishDownload(download, error: code)
                 return
@@ -654,7 +753,9 @@ public final class ProxyEngine {
 
     private func finishDownload(_ download: Download, error: ProxyErrorCode?) {
         downloadsLock.lock()
-        downloads.removeValue(forKey: download.key)
+        // Только своя запись: пока мы падали (feed.fail уже виден читателям), под этим же ключом
+        // могла стартовать новая загрузка — её снимать нельзя.
+        if downloads[download.key] === download { downloads.removeValue(forKey: download.key) }
         downloadsLock.unlock()
         cache.release(download.stream)
         // Метка о следующем сегменте здесь НЕ ставится: иначе prefetch «считает» сегмент готовым,
@@ -675,36 +776,42 @@ public final class ProxyEngine {
 
     @discardableResult
     private func schedulePrefetch(session: Session, stream: CacheStore.Stream,
-                                  resource: PlaylistResource, from index: Int) -> Int {
+                                  resource: PlaylistResource, from index: Int, force: Bool = false) -> Int {
         guard session.cacheable, config.prefetchMaxSegments > 0 else { return 0 }
         let media = resource.result.media
-        guard index + 1 < media.segments.count else { return 0 }
+        // `index` — последний запрошенный плеером сегмент; он включён в окно (`+1`), потому что
+        // залипает обычно именно он. `force` — не считаться с кулдауном неудачной загрузки.
+        let first = max(0, index + 1)
+        guard first < media.segments.count else { return 0 }
         let avg = media.segments.isEmpty ? 6 : max(0.5, media.totalDuration / Double(media.segments.count))
         let wanted = Int(ceil(max(1, config.prefetchSeconds) / avg))
         let count = min(max(0, config.prefetchMaxSegments), max(1, wanted))
         guard count > 0 else { return 0 }
-        let end = min(media.segments.count - 1, index + count)
+        let end = min(media.segments.count - 1, first + count - 1)
         var queued = 0
-        for i in (index + 1)...max(index + 1, end) {
-            guard i < media.segments.count else { continue }
+        for i in first...end {
             let segment = media.segments[i]
-            if enqueuePrefetch(session: session, stream: stream, segment: segment) { queued += 1 }
+            if enqueuePrefetch(session: session, stream: stream, segment: segment, force: force) { queued += 1 }
         }
         return queued
     }
 
     @discardableResult
-    private func enqueuePrefetch(session: Session, stream: CacheStore.Stream, segment: PlaylistSegment) -> Bool {
+    private func enqueuePrefetch(session: Session, stream: CacheStore.Stream,
+                                 segment: PlaylistSegment, force: Bool = false) -> Bool {
         guard session.cacheable else { return false }
         let key = "\(stream.key)#\(segment.index)"
         downloadsLock.lock()
-        if downloads[key] != nil || prefetched.contains("\(session.cacheKey)|\(segment.index)") {
+        // Дедуп — по живой загрузке и по состоянию записи. Постоянной метки «уже ставили» больше нет:
+        // она глушила повторную догрузку навсегда (лог 12.11: nudge → `queued: 0` при залипшем
+        // сегменте и пустом окне впереди). Упавшая загрузка (feed с ошибкой) дедупом не считается.
+        if let inFlight = downloads[key], inFlight.feed.error == nil {
             downloadsLock.unlock()
             return false
         }
         let existing = cache.entry(stream, index: segment.index)
-        // Уже скачано или недавно провалилось — новый запрос только тратит трафик.
-        if existing?.complete == true || (existing?.failedUntil ?? 0) > Date().timeIntervalSince1970 {
+        // Уже скачано или недавно провалилось — новый запрос только тратит трафик (кроме force).
+        if existing?.complete == true || (!force && (existing?.failedUntil ?? 0) > Date().timeIntervalSince1970) {
             downloadsLock.unlock()
             return false
         }
@@ -715,9 +822,8 @@ public final class ProxyEngine {
         }
         let feed = openFeed(stream, segment.index)
         let download = Download(key: key, session: session, stream: stream, segment: segment,
-                                feed: feed, isPrefetch: true)
+                                feed: feed, isPrefetch: true, url: segment.url)
         downloads[key] = download
-        prefetched.insert("\(session.cacheKey)|\(segment.index)")
         downloadsLock.unlock()
 
         prefetchQueue.addOperation { [weak self] in
@@ -839,8 +945,11 @@ public final class ProxyEngine {
         for victim in victims { releaseSessionResources(victim) }
     }
 
-    private func sessionOrigin(_ download: Download) -> String {
-        download.session.originUrl
+    /// Актуальный URL сегмента по индексу: после «перезапуска манифеста» в плейлисте уже новые URL,
+    /// и повтор должен идти на них, а не на тот, что отвалился.
+    private func currentUrl(session: Session, index: Int) -> String? {
+        guard let media = session.lock.withLock({ session.activeMedia }) else { return nil }
+        return media.result.media.segments.first(where: { $0.index == index })?.url
     }
 
     private func urlPathExtension(_ url: String) -> String {

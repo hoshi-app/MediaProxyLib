@@ -760,7 +760,9 @@ private fun testEngine() {
         val authEvent = synchronized(events) { events.firstOrNull { it.first == "onAuthRequired" } }
         eq("onAuthRequired originStatus", 403, authEvent?.second?.get("originStatus"))
 
-        // 5xx сегмента → один onError, затем cooldown без повторных запросов
+        // 5xx сегмента → один onError; кулдаун — ограничение ТОЛЬКО для prefetch.
+        // Запрос плеера кулдаун не глушит: иначе плеер получает 502 на живом сегменте и стрим
+        // перемонтируется (баг «зависло и перемонтировалось», лог 12.11).
         val badPlaylist = engine.resolve("${origin.baseUrl}/bad.m3u8", ProxyEngine.ResolveOptions("k|bad", headers))
         val badReply1 = httpGet(badPlaylist.url)
         eq("bad playlist 200", 200, badReply1.status)
@@ -769,8 +771,8 @@ private fun testEngine() {
         eq("bad segment 502", 502, bad1.status)
         eq("bad origin один раз", 1, origin.hits("bad"))
         val bad2 = httpGet(badSeg)
-        eq("bad segment cooldown 502", 502, bad2.status)
-        eq("bad origin без повторов", 1, origin.hits("bad"))
+        eq("запрос плеера не глушится кулдауном", 502, bad2.status)
+        eq("запрос плеера сходил в origin", 2, origin.hits("bad"))
         waitUntil(2000) { synchronized(events) { events.any { it.first == "onError" && it.second["code"] == "ORIGIN_5XX" } } }
 
         // таймаут сегмента → 504
@@ -1041,6 +1043,12 @@ private fun testEnginePrefetchState() {
         )
         truth("prefetch учтён один раз", waitUntil(3000) { (engine.stats()["prefetched"] as Long) == 3L })
         truth("nudge не падает", (engine.nudge(resolved.streamId)["queued"] as? Int ?: 0) >= 0)
+        // «Перезапуск манифеста» на уровне прокси (вместо перемонтажа плеера): плейлист перечитан,
+        // структура сегментов та же — значит кэш остаётся валидным и ничего не сносится.
+        val restarted = engine.restart(resolved.streamId)
+        eq("restart перечитал манифест", true, restarted["refreshed"])
+        truth("restart сохранил кэш", (engine.streamState(resolved.streamId)["cachedAheadSec"] as Double) > 0)
+        eq("restart неизвестной сессии", false, engine.restart("nope")["refreshed"])
         truth("streamState неизвестного id", engine.streamState("nope").containsKey("segments"))
 
         engine.release(resolved.streamId)

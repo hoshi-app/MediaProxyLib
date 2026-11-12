@@ -72,6 +72,14 @@ class MediaProxyModule : Module() {
             engine?.nudge(streamId) ?: mapOf("queued" to 0)
         }
 
+        /**
+         * «Перезапуск манифеста» на уровне прокси: сторож плеера просит это вместо перемонтажа.
+         * AsyncFunction: внутри сетевой перезапрос плейлиста, UI/JS-поток блокировать нельзя.
+         */
+        AsyncFunction("restartStream") { streamId: String ->
+            engine?.restart(streamId) ?: mapOf("queued" to 0, "refreshed" to false, "reason" to "NO_ENGINE")
+        }
+
         Function("setConfig") { patch: Map<String, Any?> ->
             engine?.setConfig(patch)
         }

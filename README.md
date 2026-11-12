@@ -71,9 +71,14 @@ const source = MediaProxy.resolve(origin, {
 const off = MediaProxy.onAuthRequired((e) => {
   // 400/401/403/410: перерезолвить поток и перемонтировать плеер
 });
+
+// Завис поток посередине серии (плеер голодает, буфер не растёт)? Не перемонтируйте плеер:
+// перезапустите манифест на прокси — он перечитает media-плейлист (у CDN свежие URL сегментов,
+// другой edge/подпись) и заново поставит загрузку залипшего окна. Возврат — Promise.
+const r = await MediaProxy.restart(streamId);   // { queued, refreshed, reason }
 ```
 
-Методы: `start`, `resolve`, `release`, `failOpen`, `nudge`, `setConfig`, `getStats`,
+Методы: `start`, `resolve`, `release`, `failOpen`, `nudge`, `restart`, `setConfig`, `getStats`,
 `getStreamState`, `clearCache`; события: `onError`, `onAuthRequired`, `onServerState`, `onCache`.
 Плейлисты, Range, prefetch, лимит кэша и вытеснение — нативно; JS только задаёт политику и
 разбирает ошибки.

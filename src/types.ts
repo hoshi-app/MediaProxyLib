@@ -85,6 +85,16 @@ export type StreamState = {
 
 export type FailOpenResult = { streamId?: string; originUrl?: string };
 
+/** Итог «перезапуска манифеста» на уровне прокси (сторож плеера зовёт его вместо перемонтажа). */
+export type RestartResult = {
+  /** Сколько сегментов поставлено в догрузку. */
+  queued: number;
+  /** Плейлист реально перечитан и подменён (структура сегментов не изменилась). */
+  refreshed: boolean;
+  cacheable?: boolean;
+  reason: string;
+};
+
 export type Subscription = { remove(): void };
 
 export type MediaProxyErrorCode =
@@ -157,6 +167,8 @@ export type NativeMediaProxy = {
   release(streamId: string): void;
   failOpen(streamIdOrUrl: string): FailOpenResult | null;
   nudge(streamId: string): { queued: number };
+  /** AsyncFunction в нативе: внутри сетевой перезапрос плейлиста, поэтому Promise. */
+  restartStream(streamId: string): Promise<RestartResult>;
   setConfig(patch: Partial<MediaProxyConfig>): void;
   getStats(): ProxyStats;
   getStreamState(streamId: string): StreamState;

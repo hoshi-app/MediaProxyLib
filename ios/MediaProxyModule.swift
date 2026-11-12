@@ -56,6 +56,12 @@ public final class MediaProxyModule: Module {
             self.engine?.nudge(streamId) ?? ["queued": 0]
         }
 
+        // «Перезапуск манифеста» на уровне прокси: сторож плеера просит это вместо перемонтажа.
+        // AsyncFunction: внутри сетевой запрос плейлиста (до таймаута) — JS-поток блокировать нельзя.
+        AsyncFunction("restartStream") { (streamId: String) -> [String: Any] in
+            self.engine?.restart(streamId) ?? ["queued": 0, "refreshed": false, "reason": "NO_ENGINE"]
+        }
+
         Function("setConfig") { (patch: [String: Any]) in
             self.engine?.setConfig(patch)
         }

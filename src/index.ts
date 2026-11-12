@@ -9,6 +9,7 @@ import type {
   ProxyStats,
   ResolveOptions,
   ResolveResult,
+  RestartResult,
   ServerStateEvent,
   StartResult,
   StreamState,
@@ -203,6 +204,28 @@ export function nudge(streamId: string): { queued: number } {
   }
 }
 
+/**
+ * Перезапуск манифеста НА УРОВНЕ ПРОКСИ: перечитывает media-плейлист (свежие URL сегментов у CDN)
+ * и заново ставит загрузку залипшего окна. Плееру перемонтироваться не нужно — этого и добиваемся.
+ * Асинхронный: в нативе это AsyncFunction (внутри сетевой запрос плейлиста).
+ */
+export async function restart(streamId: string): Promise<RestartResult> {
+  const native = loadNative();
+  const empty: RestartResult = { queued: 0, refreshed: false, reason: 'NO_NATIVE' };
+  if (!native || !streamId) return empty;
+  try {
+    const raw = asRecord(await native.restartStream(streamId));
+    return {
+      queued: asNumber(raw.queued),
+      refreshed: asBoolean(raw.refreshed),
+      cacheable: asBoolean(raw.cacheable, true),
+      reason: asString(raw.reason, 'ok'),
+    };
+  } catch {
+    return empty;
+  }
+}
+
 /** Меняет политику на лету; применяется к следующим запросам. */
 export function setConfig(patch: Partial<MediaProxyConfig>): void {
   const native = loadNative();
@@ -281,6 +304,7 @@ export type {
   ProxyStats,
   ResolveOptions,
   ResolveResult,
+  RestartResult,
   SegmentState,
   ServerStateEvent,
   StartResult,
