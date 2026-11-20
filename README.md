@@ -180,6 +180,27 @@ MediaProxy.onRecover((e) => {
 });
 ```
 
+### Подсказка контейнера (Android)
+
+ExoPlayer выбирает HLS по расширению последнего сегмента URL. Варианты CVH приходят без
+расширения (`…/id/…/video/`): без явного `type` ExoPlayer строит progressive-источник и
+падает `UnrecognizedInputFormatException` — чёрный экран и ремонты подряд.
+
+Loopback-URL из `resolve()` всегда оканчивается на `.m3u8` ([docs/PROTOCOL.md](docs/PROTOCOL.md),
+§1), поэтому кэшированный поток подсказки не требует. Она нужна для исходного URL:
+`cached: false`, `failOpen()` и игра мимо прокси.
+
+```tsx
+import * as MediaProxy from 'react-native-media-proxy';
+
+const uri = resolved.cached ? resolved.url : origin;
+const source = { uri, headers, ...(MediaProxy.isHlsUrl(uri) ? { type: 'm3u8' } : {}) };
+```
+
+`isHlsUrl(url)` — чистая функция: `true`, если в последнем сегменте пути нет расширения или это
+`.m3u8`; точки в каталогах и в query расширением не считаются. Проверка правила:
+`node tools/check-hls-url.mjs`.
+
 ## Проверка работоспособности
 
 ```ts

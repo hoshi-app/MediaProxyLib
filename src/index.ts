@@ -302,6 +302,9 @@ export const onCache = (listener: (event: CacheEvent) => void): Subscription =>
 export const onRecover = (listener: (event: RecoverEvent) => void): Subscription =>
   subscribe<RecoverEvent>('onRecover', listener);
 
+/** HLS ли это по URL: нужно для подсказки `source.type` плееру (см. src/hls.ts). */
+export { isHlsUrl } from './hls';
+
 export type {
   AuthRequiredEvent,
   CacheEvent,
