@@ -306,6 +306,19 @@ The project is experimental. Verified:
   cache states. (Russian)
 - [docs/PLAN.md](docs/PLAN.md) — rationale for decisions and limitations. (Russian)
 
+## Releases
+
+`main` is covered by CI. Publishing runs in GitHub Actions through npm trusted publishing (OIDC),
+so no long-lived token is stored in the repository.
+
+1. Bump `version` in `package.json` and in `ios/MediaProxy.podspec`.
+2. Tag the commit: `git tag v0.1.1 && git push origin v0.1.1`.
+3. The `Publish` workflow checks the tag against `package.json`, repeats the checks and runs
+   `npm publish --provenance`.
+
+One-time setup: on the package page of npmjs.com add a trusted publisher — provider GitHub
+Actions, organization `hoshi-app`, repository `MediaProxyLib`, workflow `publish.yml`.
+
 ## License
 
 [MIT](LICENSE): use, modification and distribution without restrictions, including closed-source

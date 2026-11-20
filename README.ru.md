@@ -310,6 +310,19 @@ MediaProxy.setConfig({ debug: true });
   коды, состояния кэша.
 - [docs/PLAN.md](docs/PLAN.md) — обоснование решений и ограничений.
 
+## Релизы
+
+`main` проверяется в CI. Публикация идёт из GitHub Actions через npm trusted publishing (OIDC),
+поэтому долгоживущий токен в репозитории не хранится.
+
+1. Поднять `version` в `package.json` и в `ios/MediaProxy.podspec`.
+2. Поставить тег: `git tag v0.1.1 && git push origin v0.1.1`.
+3. Workflow `Publish` сверяет тег с `package.json`, повторяет проверки и запускает
+   `npm publish --provenance`.
+
+Разовая настройка: на странице пакета на npmjs.com добавить trusted publisher — провайдер
+GitHub Actions, организация `hoshi-app`, репозиторий `MediaProxyLib`, workflow `publish.yml`.
+
 ## Лицензия
 
 [MIT](LICENSE): использование, изменение и распространение без ограничений, включая
