@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  javascript:
+    name: TypeScript and HLS rule
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run check:hls
+      - run: npm pack --dry-run
+
+  kotlin:
+    name: Kotlin core self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - run: gradle -p tools/selftest selftest --console=plain
+
+  swift:
+    name: Swift type check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The bridge needs ExpoModulesCore, so it is only parsed; the core is type-checked.
+      - name: Type-check the core
+        run: |
+          xcrun swiftc -typecheck -swift-version 5 \
+            ios/ByteFeed.swift \
+            ios/CacheStore.swift \
+            ios/Http.swift \
+            ios/HttpServer.swift \
+            ios/OriginClient.swift \
+            ios/PlaylistRewriter.swift \
+            ios/ProxyConfig.swift \
+            ios/ProxyEngine.swift
+      - name: Parse the Expo module bridge
+        run: xcrun swiftc -parse -swift-version 5 ios/MediaProxyModule.swift

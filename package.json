@@ -1,10 +1,11 @@
 {
   "name": "react-native-media-proxy",
   "version": "0.1.0",
-  "description": "Loopback HLS-прокси с дисковым кэшем для react-native-video/expo-video: заголовки сессии, Range, prefetch, ретраи, управление кэшем из JS.",
+  "description": "Loopback HLS proxy with disk cache for react-native-video and expo-video: session headers, Range, prefetch, retries, cache control from JS.",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "license": "MIT",
+  "author": "kalempurt",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/hoshi-app/MediaProxyLib.git"
@@ -13,10 +14,14 @@
   "bugs": {
     "url": "https://github.com/hoshi-app/MediaProxyLib/issues"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "src",
     "ios",
     "android",
+    "!android/src/test",
     "app.plugin.js",
     "expo-module.config.json",
     "docs"
@@ -34,6 +39,7 @@
     "react-native": "*"
   },
   "scripts": {
+    "typecheck": "tsc --noEmit",
     "check:hls": "node tools/check-hls-url.mjs"
   },
   "devDependencies": {
