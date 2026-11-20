@@ -40,7 +40,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "check:hls": "node tools/check-hls-url.mjs"
+    "check:hls": "node tools/check-hls-url.mjs",
+    "prepublishOnly": "npm run typecheck && npm run check:hls"
   },
   "devDependencies": {
     "typescript": "^5.6.0"
