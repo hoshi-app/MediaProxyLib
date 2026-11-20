@@ -3,7 +3,7 @@
 ## Language
 
 - Code comments, identifiers, and commit messages are written in English.
-- User-facing documentation (`README.md`, `docs/`) is written in Russian. Do not translate it unless asked.
+- `README.md` is English and is the main README; `README.ru.md` is its Russian translation, and `docs/` is in Russian.
 - Reply to the user in the language they used.
 
 ## Comments

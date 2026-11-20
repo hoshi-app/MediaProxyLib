@@ -26,3 +26,4 @@ out/
 *.tmp
 *.log
 !docs/*.log
+/.npm-cache-tmp

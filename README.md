@@ -1,83 +1,38 @@
-<div align="center">
+# react-native-media-proxy
 
-# MediaProxyLib
+A local HLS proxy with a disk cache for React Native apps on iOS and Android.
 
-Локальный HTTP-прокси с дисковым кэшем для HLS в React Native (iOS + Android).
+**English** · [Русский](README.ru.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform: iOS / Android](https://img.shields.io/badge/platform-iOS%20%7C%20Android-lightgrey.svg)](#совместимость)
-[![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#статус)
+[![Platform: iOS / Android](https://img.shields.io/badge/platform-iOS%20%7C%20Android-lightgrey.svg)](#requirements)
+[![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#status)
 
-</div>
+## Why
 
----
+Native players (AVPlayer, ExoPlayer) cannot set headers on segment requests and do not expose
+control over the disk cache. This library runs an HTTP server on `127.0.0.1` inside your app
+process, puts it between the player and the CDN, and solves both problems the same way on iOS
+and Android:
 
-## Назначение
+- session headers (`User-Agent`, `Referer`, `Cookie`) are sent to playlists, segments and keys;
+- segments are cached on disk and survive app restarts;
+- playback can resume from the bytes already on disk after a network drop.
 
-Библиотека поднимает в процессе приложения HTTP-сервер на `127.0.0.1` и ставит его
-между плеером и источником видео. Плеер получает loopback-URL вместо ссылки на CDN.
+## Requirements
 
-Причина: нативные плееры (AVPlayer, ExoPlayer) не позволяют задать заголовки для
-запросов сегментов и не дают управлять дисковым кэшем. Прокси решает обе задачи
-одинаково на обеих платформах.
+- Expo module project (`expo-modules-core`).
+- iOS 15+.
+- Any player that accepts a regular URL: `react-native-video`, `expo-video`, etc.
+- Not published to npm; install from the repository.
 
-Термины: **плейлист** — список сегментов, **сегмент** — фрагмент видеофайла
-(несколько секунд), **loopback-URL** — адрес вида `http://127.0.0.1:<порт>/...`.
-
-## Возможности
-
-- **Заголовки сессии** (`User-Agent`, `Referer`, `Cookie`) передаются на плейлисты,
-  сегменты и ключи. Cookie из `Set-Cookie` сохраняются в cookie jar сессии.
-- **Дисковый кэш**: лимит в мегабайтах, автоматическое вытеснение, ручная очистка,
-  статистика. Данные переживают перезапуск приложения.
-- **Догрузка с префикса**: после обрыва загрузка продолжается с последнего
-  записанного байта, а не с начала.
-- **Предзагрузка**: 30 секунд вперёд, не более 6 сегментов, 2 параллельно.
-- **Восстановление**: при отсутствии прироста байтов движок перечитывает плейлист и
-  возобновляет загрузку по новым URL. Перемонтирование плеера не требуется.
-- **События**: ошибки, отказ авторизации, состояние сервера, состояние кэша,
-  автовосстановление.
-- **Ключи AES-128** не записываются на диск — только в памяти сессии.
-
-## Ограничения
-
-- DRM (FairPlay, Widevine) не поддерживается.
-- Live и LL-HLS проксируются без кэширования.
-- AirPlay с loopback-URL не работает.
-- ABR (выбор качества) не реализован: прокси отдаёт то, что запросил плеер.
-- Собственного foreground-сервиса на Android нет: фон обеспечивает сервис плеера.
-
-## Как это работает
-
-1. `start()` поднимает HTTP-сервер на `127.0.0.1` (эфемерный порт, на время процесса).
-2. `resolve(url, options)` создаёт сессию с заголовками и возвращает loopback-URL с
-   идентификатором сессии.
-3. Плеер запрашивает по этому URL плейлисты и сегменты.
-4. Прокси загружает плейлист, переписывает ссылки на loopback-адреса и кэширует
-   сегменты на диск.
-5. Частичные запросы (перемотка) отдаются из записанного префикса, остаток
-   догружается.
-6. Повторный просмотр и следующий запуск приложения читают данные с диска.
-
-```text
-AVPlayer / ExoPlayer  →  http://127.0.0.1:<port>/s/<sid>/<b64>/<name>.<ext>  →  прокси  →  CDN
-                                                                                   ↓
-                                                                              диск (кэш)
-```
-
-Если прокси недоступен, `resolve()` возвращает исходный URL с `cached: false` —
-приложение продолжает воспроизведение напрямую с CDN. Это поведение зафиксировано
-контрактом и не требует обработки исключений.
-
-## Установка
-
-Установка из репозитория (в npm пакет не публиковался):
+## Installation
 
 ```bash
 npm install github:hoshi-app/MediaProxyLib
 ```
 
-Config-плагин в `app.json` / `app.config.js`:
+Add the config plugin to `app.json` or `app.config.js`:
 
 ```json
 {
@@ -87,27 +42,26 @@ Config-плагин в `app.json` / `app.config.js`:
 }
 ```
 
-Затем пересборка нативных проектов:
+Then rebuild the native projects:
 
 ```bash
 npx expo prebuild --clean
 ```
 
-Плагин вносит два изменения, без которых loopback-запросы блокируются системой:
+The plugin makes two changes, both required for loopback requests to work:
 
-- **iOS** — `NSAllowsLocalNetworking` в `Info.plist`.
-- **Android** — `network_security_config` с `cleartextTrafficPermitted` только для
-  `127.0.0.1`. Глобальный `usesCleartextTraffic` не включается.
+- **iOS**: adds `NSAllowsLocalNetworking` to `Info.plist`.
+- **Android**: adds a `network_security_config` that permits cleartext traffic only for
+  `127.0.0.1`. Global `usesCleartextTraffic` is not enabled.
 
-Если в проекте уже есть свой `android:networkSecurityConfig`, плагин не перезаписывает
-его и выводит предупреждение: домен `127.0.0.1` нужно добавить вручную.
+If the project already has its own `android:networkSecurityConfig`, the plugin leaves it alone
+and prints a warning: add `127.0.0.1` manually.
 
-Для приложений без Expo (голый React Native) плагин не применяется — оба пункта
-прописываются в `Info.plist` и `AndroidManifest.xml` вручную.
+Bare React Native projects do not run the plugin; make these two changes by hand.
 
-## Использование
+## Usage
 
-### Минимальный пример
+Start the proxy once, then resolve each video URL before passing it to the player:
 
 ```ts
 import * as MediaProxy from 'react-native-media-proxy';
@@ -115,20 +69,26 @@ import * as MediaProxy from 'react-native-media-proxy';
 await MediaProxy.start();
 
 const source = MediaProxy.resolve('https://cdn.example.com/film/index.m3u8', {
-  // Постоянный ключ кэша: не меняется при перерезолве и перезапуске.
   cacheKey: 'film42|voice-ru|ep3|q720',
   headers: {
     'User-Agent': 'Mozilla/5.0 ...',
     'Referer': 'https://example.com/',
   },
 });
+
+// Pass source.url to the player. The proxy sends the headers for you.
 ```
 
-`source.url` передаётся плееру. `cached: true` означает «кэш на диске включён», а не
-«сегменты уже загружены»; прогретую часть смотрите в `getStreamState().cachedAheadSec`.
-Если `cached: false` — играйте исходный URL с теми же заголовками.
+`resolve()` is synchronous and never throws. If the proxy cannot be used, it returns the
+original URL with `cached: false`; play that URL with the same headers and nothing breaks.
 
-### Компонент плеера
+`cached: true` means "disk caching is on", not "segments are already downloaded". To check
+what is actually on disk, use `getStreamState()`.
+
+Use a stable `cacheKey` for the same video. If it changes between runs, the old cache entries
+are not reused.
+
+### Player component
 
 ```tsx
 import { useEffect, useMemo, useState } from 'react';
@@ -153,159 +113,206 @@ export function Player({ url, headers, cacheKey }) {
 }
 ```
 
-### Состояние кэша
+### Cache state
 
 ```ts
 const state = MediaProxy.getStreamState(source.streamId);
 
-state.cachedAheadSec; // сколько секунд вперёд уже на диске
-state.segments;       // по каждому сегменту: cachedBytes, complete
+state.cachedAheadSec; // seconds available ahead of the current position
+state.segments;       // per segment: cachedBytes, complete
 ```
 
-### Обработка ошибок
+### Errors and recovery
 
 ```ts
-MediaProxy.onAuthRequired((e) => {
-  // 400/401/403/410: истекла подпись, сменился IP, протухла сессия.
-  // Требуется новый URL от API приложения и перемонтирование плеера.
+const authSub = MediaProxy.onAuthRequired((e) => {
+  // 400/401/403/410: the signed URL or session has expired.
+  // Fetch a fresh URL from your API and reload the source.
   console.log(e.streamId, e.originStatus);
 });
 
-MediaProxy.onError((e) => {
+const errorSub = MediaProxy.onError((e) => {
   console.log(e.code, e.message, e.retryable, e.fatal);
 });
 
-MediaProxy.onRecover((e) => {
-  // Движок перечитал плейлист и возобновил загрузку без перемонтирования плеера.
+MediaProxy.onRecover(() => {
+  // The proxy re-read the playlist and resumed downloading.
+  // The player does not need to be remounted.
 });
+
+// Later
+authSub.remove();
+errorSub.remove();
 ```
 
-### Подсказка контейнера (Android)
+## Android: HLS source type
 
-ExoPlayer выбирает HLS по расширению последнего сегмента URL. Варианты CVH приходят без
-расширения (`…/id/…/video/`): без явного `type` ExoPlayer строит progressive-источник и
-падает `UnrecognizedInputFormatException` — чёрный экран и ремонты подряд.
+ExoPlayer guesses the container from the extension of the last URL path segment. Some HLS
+variant URLs have no extension (`.../id/.../video/`), and ExoPlayer then creates a progressive
+source and fails with `UnrecognizedInputFormatException`.
 
-Loopback-URL из `resolve()` всегда оканчивается на `.m3u8` ([docs/PROTOCOL.md](docs/PROTOCOL.md),
-§1), поэтому кэшированный поток подсказки не требует. Она нужна для исходного URL:
-`cached: false`, `failOpen()` и игра мимо прокси.
+Loopback URLs from `resolve()` always end in `.m3u8`, so cached playback needs no hint. The
+origin URL does, for example when `cached` is `false` or after `failOpen()`:
 
 ```tsx
-import * as MediaProxy from 'react-native-media-proxy';
-
-const uri = resolved.cached ? resolved.url : origin;
-const source = { uri, headers, ...(MediaProxy.isHlsUrl(uri) ? { type: 'm3u8' } : {}) };
+const uri = resolved.cached ? resolved.url : originUrl;
+const source = {
+  uri,
+  headers,
+  ...(MediaProxy.isHlsUrl(uri) ? { type: 'm3u8' } : {}),
+};
 ```
 
-`isHlsUrl(url)` — чистая функция: `true`, если в последнем сегменте пути нет расширения или это
-`.m3u8`; точки в каталогах и в query расширением не считаются. Проверка правила:
-`node tools/check-hls-url.mjs`.
+`isHlsUrl(url)` returns `true` when the last path segment has no extension or ends in
+`.m3u8`. Dots in directories and query strings are ignored. Rule check:
+`npm run check:hls`.
 
-## Проверка работоспособности
+## API
+
+### Methods
+
+| Method | Description |
+|---|---|
+| `start()` | Starts the server once per process. Returns the port, base URL and startup issues. |
+| `resolve(url, options?)` | Creates a session and returns the loopback URL. Synchronous, never throws. |
+| `release(streamId)` | Releases the session and cancels prefetch. Cached data stays on disk. |
+| `failOpen(streamIdOrUrl)` | Switches the session back to the origin URL. |
+| `nudge(streamId)` | Queues a prefetch window starting at the last requested segment. |
+| `restart(streamId)` | Re-reads the playlist and re-queues downloads without remounting the player. |
+| `setConfig(patch)` | Changes policy at runtime. |
+| `getStats()` | Port, cache size, hits, misses, recoveries. |
+| `getStreamState(streamId)` | Per-segment cache state. |
+| `clearCache(streamId?)` | Clears all cache, or the cache of one stream. |
+| `isAvailable()` | Whether the native module is loaded. |
+| `getDefaultConfig()` | A copy of the default configuration. |
+
+`resolve()` options:
+
+| Option | Description |
+|---|---|
+| `cacheKey` | Stable cache identity. Must not change between runs. |
+| `headers` | Headers for playlists, segments and keys. |
+| `cache` | `false` disables disk cache for this stream (live, debugging). |
+| `prewarm` | Prefetch the playlist and first segments. Defaults to `true`. |
+
+### Events
+
+| Event | Payload |
+|---|---|
+| `onError` | Error code, origin status, message, retryable/fatal flags. |
+| `onAuthRequired` | Origin returned 400/401/403/410; a new URL is needed. |
+| `onServerState` | Server started, restarted or stopped. |
+| `onCache` | Eviction, clear, full or reconciliation. |
+| `onRecover` | A stalled download was recovered without a player remount. |
+
+## Configuration
+
+`setConfig(patch)` merges a partial update; unknown keys are ignored. The full type is in
+[src/types.ts](src/types.ts).
+
+Common settings:
+
+| Option | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Turns the proxy on or off. |
+| `maxCacheMB` | `512` | Total disk budget for all videos. |
+| `minFreeDiskMB` | `2048` | Below this much free disk space, caching is disabled. |
+| `maxSessions` | `4` | Concurrent sessions. |
+| `prefetchSeconds` | `30` | How far ahead to prefetch. |
+| `prefetchMaxSegments` | `6` | Maximum segments in the prefetch window. |
+| `prewarmSegments` | `2` | Segments downloaded right after `resolve()`. |
+| `stallKickSec` | `6` | Byte-progress timeout before the engine re-reads the playlist. |
+| `recoveryMax` | `2` | Recovery attempts per segment. |
+| `debug` | `false` | Logs and the `X-MediaProxy-Cache` response header. |
+
+Advanced settings:
+
+| Option | Default | Description |
+|---|---|---|
+| `prefetchConcurrency` | `2` | Parallel prefetch downloads. |
+| `interactiveConcurrency` | `4` | Parallel player requests. |
+| `prefetchRetries` | `3` | Retries for prefetch downloads. |
+| `prefetchFirstByteSec` | `10` | First-byte timeout for prefetch. |
+| `prefetchSilenceSec` | `15` | Stall timeout for prefetch. |
+| `reqConnectSec` | `5` | Connect timeout for player requests. |
+| `reqFirstByteSec` | `5` | First-byte timeout for player requests. |
+| `reqSilenceSec` | `4` | Stall timeout for player requests. |
+| `minSpeedKBps` | `1` | Minimum speed for prefetch and resumed downloads. |
+| `cooldownSec` | `30` | Pause before retrying a failed segment. |
+| `serving` | `'stream'` | `'stream'` sends bytes as they arrive; `'complete'` downloads the whole segment first. |
+
+Request timeouts are intentionally shorter than the player's own timeouts. Otherwise the
+player gives up before the proxy has a chance to recover.
+
+## How it works
+
+1. `start()` binds an HTTP server to `127.0.0.1` on an ephemeral port.
+2. `resolve(url, options)` creates a session and returns a loopback URL for that session.
+3. The player requests playlists and segments through the loopback URL.
+4. The proxy downloads the playlist, rewrites segment URLs to loopback URLs, and caches
+   segments on disk.
+5. Range requests are served from the bytes already on disk; the rest is downloaded.
+6. On the next play, cached segments are served without touching the CDN.
+
+```text
+AVPlayer / ExoPlayer
+        │
+        ▼
+http://127.0.0.1:<port>/s/<sid>/<b64>/<name>.<ext>
+        │
+        ▼
+   native proxy  ──►  CDN
+        │
+        ▼
+   disk cache
+```
+
+AES-128 keys are kept in memory only and are never written to disk.
+
+## Cache
+
+- Location: `<app cache dir>/mediaproxy/v1/<hash of cacheKey>/`.
+- Limit: `maxCacheMB`, shared by all videos.
+- Eviction works on whole cache entries, not individual segments, so an episode is cached as a
+  unit.
+- At 90% of the limit prefetch stops. At 100% new entries are not created, but serving
+  continues.
+- On startup the journal is checked against the files on disk; incomplete files are trimmed
+  and orphaned files are removed.
+- `clearCache()` clears everything; `clearCache(streamId)` clears one stream.
+
+## Debugging
 
 ```ts
 MediaProxy.setConfig({ debug: true });
 ```
 
-1. Логи: созданные ссылки, источник байтов, ошибки. Подписи и токены вырезаются.
-2. Заголовок ответа `X-MediaProxy-Cache: hit | miss | partial | passthrough`
-   (только при `debug: true`).
-3. `getStats()`: занято на диске, попадания, промахи, число автовосстановлений.
+1. Logs show created URLs, byte sources and errors. Signatures and tokens are redacted.
+2. Responses include `X-MediaProxy-Cache: hit | miss | partial | passthrough` when debug is on.
+3. `getStats()` shows disk usage, hits, misses and the number of automatic recoveries.
 
-При повторном просмотре того же ролика `hits` растут, `misses` не меняются.
+On a second play of the same video, `hits` should grow and `misses` should not.
 
-## API
+## Limitations
 
-### Методы
+- DRM (FairPlay, Widevine) is not supported.
+- Live and LL-HLS streams are proxied without caching.
+- AirPlay does not work with loopback URLs.
+- ABR is not implemented: the proxy serves what the player asks for.
+- There is no Android foreground service; background playback depends on the player's service.
+- The cache is local to the app, not shared between devices.
 
-| Метод | Описание |
-|---|---|
-| `start()` | Поднимает сервер. Один раз за процесс. Возвращает порт и список проблем. |
-| `resolve(url, options?)` | Создаёт сессию, возвращает ссылку для плеера. Синхронный, не бросает. |
-| `release(streamId)` | Освобождает сессию, отменяет предзагрузку. Кэш остаётся на диске. |
-| `failOpen(streamId)` | Переводит сессию на исходный URL (после ошибки плеера). |
-| `nudge(streamId)` | Ставит окно предзагрузки от последнего запрошенного сегмента. |
-| `restart(streamId)` | Перечитывает плейлист и заново ставит загрузку. Не требует перемонтирования. |
-| `setConfig(patch)` | Меняет политику на ходу. |
-| `getStats()` | Порт, объём кэша, попадания, промахи, восстановления. |
-| `getStreamState(streamId)` | Состояние сегментов: байты на диске, признак завершения. |
-| `clearCache(streamId?)` | Очищает кэш целиком или для одного видео. |
+## Status
 
-### События
+Experimental. The Android core (Kotlin) has an automated self-test and the TypeScript layer
+type-checks; iOS builds successfully. The full Android library has not been built inside a host
+app yet. There is no CI, and performance has not been measured on real titles.
 
-| Событие | Содержание |
-|---|---|
-| `onError` | Один раз на переход в состояние ошибки: код, статус источника, текст. |
-| `onAuthRequired` | 400/401/403/410 — требуется новый URL. |
-| `onServerState` | Запуск, перезапуск, остановка сервера. |
-| `onCache` | Вытеснение, очистка, заполнение. |
-| `onRecover` | Автоматическое восстановление после зависания. |
+## Documentation
 
-### Настройки
+- [docs/PROTOCOL.md](docs/PROTOCOL.md): behavior contract for iOS and Android (in Russian).
+- [docs/PLAN.md](docs/PLAN.md): design decisions and tradeoffs (in Russian).
 
-`setConfig(patch)` — частичное обновление; неизвестные ключи игнорируются. Полный
-список — в [src/types.ts](src/types.ts).
+## License
 
-| Параметр | По умолчанию | Описание |
-|---|---|---|
-| `enabled` | `true` | Включает прокси. |
-| `maxCacheMB` | `512` | Лимит кэша на диске. |
-| `minFreeDiskMB` | `2048` | Ниже этого объёма свободного места кэширование отключается. |
-| `maxSessions` | `4` | Число одновременных сессий. |
-| `prefetchSeconds` | `30` | Глубина предзагрузки в секундах. |
-| `prefetchMaxSegments` | `6` | Предел сегментов в окне предзагрузки. |
-| `prefetchConcurrency` | `2` | Параллельных загрузок предзагрузки. |
-| `prefetchRetries` | `3` | Повторы для предзагрузки. |
-| `cooldownSec` | `30` | Пауза между попытками для упавшего сегмента. |
-| `prewarmSegments` | `2` | Сегменты, загружаемые сразу после `resolve`. |
-| `stallKickSec` | `6` | Отсутствие прироста байтов, после которого движок перечитывает плейлист. |
-| `recoveryMax` | `2` | Попыток восстановления на сегмент. |
-| `debug` | `false` | Логи и заголовок `X-MediaProxy-Cache`. |
-
-Таймауты (`reqConnectSec`, `reqFirstByteSec`, `reqSilenceSec`, `prefetchFirstByteSec`,
-`prefetchSilenceSec`) заданы короче таймаутов плееров: иначе плеер успевает
-перемонтировать источник раньше, чем прокси реагирует.
-
-## Кэш
-
-- Каталог: `Caches/mediaproxy/v1/<хеш cacheKey>/`.
-- Лимит по умолчанию — 512 МБ суммарно на все видео.
-- Вытеснение выполняется целыми записями каталога. Сегменты внутри записи не
-  вытесняются: эпизод смотрится последовательно.
-- Активная запись (запрос за последние две минуты) не вытесняется.
-- При 90 % лимита предзагрузка останавливается; при 100 % новые записи не
-  создаются, отдача продолжается.
-- При старте приложения журнал сверяется с файлами: короткие файлы подрезаются,
-  лишние удаляются.
-- `clearCache()` очищает всё, `clearCache(streamId)` — только эту запись.
-
-## Совместимость
-
-- Expo (модуль собран как Expo-модуль, требует `expo-modules-core`).
-- iOS 15.0+.
-- Плееры: `react-native-video`, `expo-video` и любой другой, принимающий обычный URL.
-
-## Статус
-
-Проект экспериментальный. Проверено:
-
-| Часть | Состояние |
-|---|---|
-| Android-ядро (Kotlin) | собрано, 301 автоматическая проверка проходит |
-| TypeScript-обвязка | проверка типов проходит |
-| Android-библиотека целиком (Gradle + Expo-слой) | не собиралась: нужен host-проект |
-| iOS (Swift) | собирается успешно |
-| CI | отсутствует |
-| Замеры производительности на реальных роликах | не проводились |
-
-## Документация
-
-- [docs/PROTOCOL.md](docs/PROTOCOL.md) — контракт поведения iOS и Android: ответы,
-  коды, состояния кэша.
-- [docs/PLAN.md](docs/PLAN.md) — обоснование решений и ограничений.
-
-## Лицензия
-
-[MIT](LICENSE): использование, изменение и распространение без ограничений, включая
-закрытые и коммерческие проекты. Условие — сохранить текст лицензии и указание
-авторства.
+[MIT](LICENSE).
