@@ -4,8 +4,8 @@ import java.io.File
 import java.io.IOException
 
 /**
- * Дисковый кэш сегментов: append-only журнал, сверка с файлами при старте, LRU целыми стримами,
- * refcount для отложенного удаления. Никаких tmp→rename на каждом сегменте (класс ошибок B-01).
+ * Segment disk cache: append-only journal, reconciliation with files at startup, whole-stream LRU,
+ * and refcounts for deferred deletion. No tmp-to-rename per segment.
  */
 class CacheStore(
     private val root: File,
@@ -18,7 +18,7 @@ class CacheStore(
         var complete: Boolean = false,
         var failedUntil: Long = 0,
         var contentType: String? = null,
-        /** ETag последнего ответа origin: нужен для `If-Range` при докачке с префикса. */
+        /** ETag of the last origin response, needed for `If-Range` on a prefix resume. */
         var etag: String? = null,
         var downloading: Boolean = false,
         var feed: ByteFeed? = null,
@@ -132,7 +132,7 @@ class CacheStore(
 
     // MARK: - eviction
 
-    /** Освобождает место под `required` байт. false — места нет, тогда pass-through. */
+    /** Frees room for `required` bytes. Returns false when there is no room; the caller then uses pass-through. */
     fun evictIfNeeded(required: Long, protecting: Set<String>, now: Long): Boolean {
         synchronized(lock) {
             val cfg = config()
@@ -155,7 +155,7 @@ class CacheStore(
         }
     }
 
-    /** Сколько стримов вытеснено с момента старта — для `getStats().evictions`. */
+    /** Streams evicted since start, for `getStats().evictions`. */
     fun evictedCount(): Long = synchronized(lock) { evictedStreams }
 
     private fun totalBytesLocked(): Long = streams.values.sumOf { streamBytesLocked(it) }
@@ -172,8 +172,8 @@ class CacheStore(
             }
             for (stream in targets) {
                 freed += streamBytesLocked(stream)
-                // Записи чистим всегда: иначе после clear сервер отдавал бы «complete»-сегменты,
-                // файлов которых уже нет (FileBody падает, а плеер видит обрыв).
+                // Always drop entries; otherwise after clear the server would serve complete segments
+                // whose files are gone. FileBody fails and the player sees a truncated body.
                 stream.entries.clear()
                 streams.remove(stream.key)
                 stream.dir.deleteRecursively()
@@ -187,17 +187,18 @@ class CacheStore(
     private fun loadLocked(stream: Stream) {
         val journal = File(stream.dir, "journal.log")
         val lines = Fs.readLines(journal)
-        // Шапка — единственный способ после рестарта процесса отличить «тот же контент» от другого
-        // плейлиста с тем же cacheKey. Без сверки отпечатка отдавались бы готовые сегменты чужого
-        // контента (PROTOCOL §3). Формат H|2: отпечаток идёт ПЕРЕД cacheKey, потому что cacheKey
-        // приложения содержит `|` (`t1|p-x|e2|q720`), и разбирать его на части нельзя.
+        // The header is the only way to tell the same content from another playlist with the same
+        // cacheKey after a process restart. Without the fingerprint check we would serve ready
+        // segments of the wrong content.
+        // In `H|2` the fingerprint comes before cacheKey because app cacheKeys contain `|`
+        // (`t1|p-x|e2|q720`) and cannot be split.
         val header = lines.lastOrNull { it.startsWith("H|") }
         val segments = lines.any { it.startsWith("S|") }
         if (segments && !headerMatches(header, stream)) {
             wipeLocked(stream)
             return
         }
-        // Append-only журнал: последняя запись по индексу побеждает, сверка с файлом — один раз на запись.
+        // Append-only journal: the last record per index wins, and each record is checked against its file once.
         val latest = HashMap<Int, Entry>()
         for (line in lines) {
             val parts = line.split("|")
@@ -222,7 +223,6 @@ class CacheStore(
             if (entry.total < 0) entry.complete = false
             if (entry.prefix > 0 || entry.complete) stream.entries[index] = entry
         }
-        // Файлы, которых нет в журнале, — сироты.
         val known = stream.entries.keys.map { fileURL(stream, it).name }.toSet()
         stream.dir.listFiles()?.forEach { file ->
             if (file.name.endsWith(".bin") && file.name !in known) file.delete()
@@ -243,7 +243,7 @@ class CacheStore(
         try {
             journal.writeText(text, Charsets.UTF_8)
         } catch (_: IOException) {
-            // журнал — кэш: сбой записи не должен ломать воспроизведение
+            // The journal is cache, so a write failure must not break playback.
         }
     }
 
@@ -256,7 +256,7 @@ class CacheStore(
         return fingerprint == stream.fingerprint && cacheKey == stream.cacheKey
     }
 
-    /** Снос невалидного каталога: чужие/битые записи не должны пережить смену плейлиста. */
+    /** Wipes an invalid directory so foreign or corrupt entries do not survive a playlist change. */
     private fun wipeLocked(stream: Stream) {
         stream.entries.clear()
         stream.dir.listFiles()?.forEach { file ->

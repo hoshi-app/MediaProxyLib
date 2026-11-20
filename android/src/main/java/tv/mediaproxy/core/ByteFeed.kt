@@ -1,8 +1,8 @@
 package tv.mediaproxy.core
 
 /**
- * Общий буфер между загрузчиком и отдачей. Пишет в файл (кэш) или в память (pass-through).
- * Читатель ждёт `written >= N` на condition, а не EOF файла: иначе получит обрезанное тело (P-11).
+ * Shared buffer between the downloader and serving. Writes to a file (cache) or to memory (pass-through).
+ * Readers wait for `written >= N` on a condition rather than file EOF, which would cut the body short.
  */
 class ByteFeed(val file: java.io.File?, resumeFrom: Long = 0L) {
     private val monitor = Object()
@@ -27,8 +27,8 @@ class ByteFeed(val file: java.io.File?, resumeFrom: Long = 0L) {
     init {
         if (file != null) {
             Fs.ensureDir(file.absoluteFile.parentFile)
-            // Докачка с префикса: файл открывается на дозапись, `written` стартует с того, что уже
-            // лежит на диске (иначе повторный запрос плеера затирал бы прогретое — §2.4 п.9).
+            // Resume: open the file for append and start `written` at the bytes already on disk.
+            // Otherwise a repeated player request would wipe the downloaded prefix.
             val resume = resumeFrom.coerceIn(0L, Fs.size(file))
             if (resume > 0) {
                 writtenBytes = resume
@@ -100,9 +100,9 @@ class ByteFeed(val file: java.io.File?, resumeFrom: Long = 0L) {
     }
 
     /**
-     * Ждёт метаданные ответа (размер/тип). Именно они нужны, чтобы решить, отдавать из кэша,
-     * пасsthrough или рвать по таймауту. Учитывает докачку: `written` может быть > 0 сразу
-     * (префикс уже на диске), и ждать «первый байт» в этом случае бессмысленно.
+     * Waits for response metadata (size and type), which decides cache serving, pass-through, or timeout.
+     * Accounts for resume: `written` may already be positive from an on-disk prefix, so waiting for
+     * the first byte would be pointless.
      */
     fun waitForMeta(timeoutMs: Long): ProxyErrorCode? {
         val deadline = nowMs() + timeoutMs
@@ -118,7 +118,7 @@ class ByteFeed(val file: java.io.File?, resumeFrom: Long = 0L) {
         }
     }
 
-    /** Ждёт первый байт/ошибку. null — дождались; иначе код (включая таймаут). */
+    /** Waits for the first byte or an error. Returns null on success, otherwise the code, including timeout. */
     fun waitForFirstBytes(timeoutMs: Long): ProxyErrorCode? {
         val deadline = nowMs() + timeoutMs
         synchronized(monitor) {
@@ -133,7 +133,7 @@ class ByteFeed(val file: java.io.File?, resumeFrom: Long = 0L) {
         }
     }
 
-    /** Ждёт, пока появится байт с офсетом `offset`; возвращает доступный префикс. */
+    /** Waits until the byte at `offset` is available. Returns the available prefix length. */
     fun waitFor(offset: Long, timeoutMs: Long): Long {
         val deadline = nowMs() + timeoutMs
         synchronized(monitor) {
@@ -158,7 +158,7 @@ class ByteFeed(val file: java.io.File?, resumeFrom: Long = 0L) {
         }
     }
 
-    /** Pass-through: следующая порция из памяти. null — поток завершён. */
+    /** Pass-through: returns the next chunk from memory, or null when the stream is done. */
     fun readChunk(maxBytes: Int, timeoutMs: Long): ByteArray? {
         val deadline = nowMs() + timeoutMs
         synchronized(monitor) {

@@ -6,8 +6,8 @@ import java.io.File
 import tv.mediaproxy.core.ProxyEngine
 
 /**
- * Expo-модуль: тонкая оболочка над ProxyEngine. Вся работа — в ядре; здесь только контракт с JS.
- * Preflight проверяет cleartext для 127.0.0.1 до первого запроса плеера.
+ * Expo module: a thin shell over ProxyEngine. All work happens in the core; this is only the JS
+ * contract. The preflight check verifies cleartext for 127.0.0.1 before the player's first request.
  */
 class MediaProxyModule : Module() {
     private var engine: ProxyEngine? = null
@@ -73,8 +73,8 @@ class MediaProxyModule : Module() {
         }
 
         /**
-         * «Перезапуск манифеста» на уровне прокси: сторож плеера просит это вместо перемонтажа.
-         * AsyncFunction: внутри сетевой перезапрос плейлиста, UI/JS-поток блокировать нельзя.
+         * Media playlist refresh at the proxy level, requested by the player's stall detector instead
+         * of a remount. AsyncFunction because it re-fetches the playlist and must not block JS.
          */
         AsyncFunction("restartStream") { streamId: String ->
             engine?.restart(streamId) ?: mapOf("queued" to 0, "refreshed" to false, "reason" to "NO_ENGINE")

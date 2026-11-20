@@ -5,7 +5,7 @@ public enum ResourceKind {
     case segment
     case key
 
-    /// Расширение в loopback-URL обязательно: AVURLAsset выбирает демуксер по расширению/UTI.
+    /// The loopback URL needs an extension: AVURLAsset picks the demuxer from the extension or UTI.
     public var fallbackExtension: String {
         switch self {
         case .playlist: return "m3u8"
@@ -82,8 +82,8 @@ public enum Http {
         504: "Gateway Timeout",
     ]
 
-    /// Трёхзначный разбор `Range`: «несколько диапазонов/не распознан» (отдаём 200 целиком) —
-    /// это не то же самое, что «диапазон за пределом ресурса» (416).
+    /// Three-way `Range` result. Multiple or unparsable ranges get a full 200,
+    /// unlike a range beyond the resource, which gets 416.
     public enum RangeResult {
         case none
         case valid(start: Int64, end: Int64)
@@ -102,7 +102,7 @@ public enum Http {
         let right = parts[1].trimmingCharacters(in: .whitespaces)
 
         if left.isEmpty {
-            // suffix: bytes=-N
+            // Suffix form: bytes=-N
             guard let n = Int64(right), n > 0 else { return .unsatisfiable }
             let start = max(0, total - n)
             return .valid(start: start, end: total - 1)
@@ -115,7 +115,7 @@ public enum Http {
         return .valid(start: start, end: end)
     }
 
-    /// Начало диапазона для pass-through; 0 — если диапазона нет/он не распознан (в т.ч. suffix).
+    /// Range start for pass-through. Returns 0 when there is no usable range, including the suffix form.
     public static func rangeStart(_ header: String?) -> Int64 {
         guard let header else { return 0 }
         let spec = header.trimmingCharacters(in: .whitespaces)
@@ -127,7 +127,7 @@ public enum Http {
         return Int64(left) ?? 0
     }
 
-    /// Валидный ли origin-URL. Только http(s); loopback запрещён (иначе прокси уходит в себя).
+    /// Whether an origin URL is allowed. Only http(s), and loopback is rejected so the proxy cannot call itself.
     public static func isAllowedOrigin(_ raw: String) -> Bool {
         guard let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
@@ -154,7 +154,6 @@ public enum Http {
         var ext = url.pathExtension.lowercased()
         if kind == .playlist { ext = "m3u8" }
         if ext.isEmpty { ext = kind.fallbackExtension }
-        // оставляем только разумные символы, длина имени ограничена
         var base = url.deletingPathExtension().lastPathComponent
         base = base.replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "_", options: .regularExpression)
         if base.isEmpty || base.count > 48 { base = "r" }
@@ -172,7 +171,7 @@ public enum Http {
     }
 }
 
-/// Небольшая обёртка над файловыми операциями: одинаковые UTF-8/append/truncate на обеих платформах.
+/// Thin file wrapper with consistent UTF-8 append and truncate behavior on both platforms.
 public enum Fs {
     public static func ensureDir(_ url: URL) throws {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)

@@ -1,9 +1,9 @@
 ﻿import Foundation
 import Darwin
 
-/// Тело ответа: умеет писать только нужный диапазон (Range) в сокет.
+/// Response body that writes only the requested byte range to the socket.
 public protocol HttpResponseBody {
-    /// `count < 0` — до конца.
+    /// `count < 0` means write to the end.
     func write(to fd: Int32, offset: Int64, count: Int64, deadline: TimeInterval) throws
 }
 
@@ -12,8 +12,8 @@ public struct HttpReply {
     public var headers: [String: String]
     public var body: HttpResponseBody?
     public var length: Int64          // -1 = close-delimited
-    public var cacheState: String?    // hit | miss | partial | passthrough (для X-MediaProxy-Cache)
-    /// true — Range уже обработан (pass-through с прокинутым Range), сервер не применяет свой.
+    public var cacheState: String?    // hit | miss | partial | passthrough for X-MediaProxy-Cache
+    /// True when the range was already handled upstream, so the server must not apply its own.
     public var rangeHandled: Bool
 
     public init(status: Int, headers: [String: String] = [:], body: HttpResponseBody? = nil, length: Int64 = 0,
@@ -67,11 +67,11 @@ public struct FileBody: HttpResponseBody {
             try sendAll(fd, chunk)
             if remaining > 0 { remaining -= Int64(chunk.count) }
         }
-        if remaining > 0 { throw POSIXError(.EIO) }  // недодали обещанное — рвём соединение
+        if remaining > 0 { throw POSIXError(.EIO) }  // fewer bytes than promised: abort the connection
     }
 }
 
-/// Отдача сегмента, который ещё качается: читает файл по мере роста, ждёт на feed.
+/// Serves a segment that is still downloading: reads the growing file and waits on the feed.
 public struct GrowingFileBody: HttpResponseBody {
     let url: URL
     let feed: ByteFeed
@@ -96,14 +96,15 @@ public struct GrowingFileBody: HttpResponseBody {
             if remaining > 0 { remaining -= Int64(chunk.count) }
         }
         if remaining > 0 {
-            // Дошли до обрыва: не закрываем ответ «нормально», рвём сокет (плеер переспросит Range).
+            // The stream broke: reset instead of closing cleanly, so the player re-requests the range.
             throw POSIXError(.ECONNRESET)
         }
     }
 }
 
-/// Pass-through: отдаём по мере прихода из памяти (без диска). Тело не должно оказаться короче
-/// обещанного `Content-Length`: при провале рвём соединение, иначе плеер ждёт хвост.
+/// Pass-through: sends bytes from memory as they arrive, without touching disk.
+/// The body must not fall short of `Content-Length`, so a failure resets the connection
+/// rather than leaving the player waiting for the tail.
 public struct StreamBody: HttpResponseBody {
     let feed: ByteFeed
     public init(feed: ByteFeed) { self.feed = feed }
@@ -135,8 +136,8 @@ private func sendAll(_ fd: Int32, _ data: Data) throws {
     }
 }
 
-/// Минимальный HTTP/1.1 на loopback: GET/HEAD, keep-alive, всегда Content-Length (или close-delimited),
-/// Range/206/416, поток на соединение, лимит соединений. Без chunked — нам он не нужен.
+/// Minimal HTTP/1.1 server on loopback: GET/HEAD, keep-alive, always `Content-Length` or close-delimited.
+/// Supports Range/206/416 with one thread per connection, a connection limit, and no chunked encoding.
 public final class HttpServer {
     public typealias Handler = (_ method: String, _ path: String, _ range: String?, _ host: String?) -> HttpReply
 
@@ -223,7 +224,7 @@ public final class HttpServer {
                 continue
             }
             if semaphore.wait(timeout: .now()) == .timedOut {
-                // Слишком много соединений — отвечаем полноценным 503, а не голым телом.
+                // Too many connections: reply with a complete 503 rather than a bare body.
                 let text = "Too many connections"
                 let body = Data(text.utf8)
                 let head = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\n" +
@@ -329,8 +330,8 @@ public final class HttpServer {
         }
 
         headers["Accept-Ranges"] = length >= 0 ? "bytes" : "none"
-        // Close-delimited ответ обязан объявить `Connection: close`: сервер закроет сокет сразу
-        // после тела, и клиент не должен пытаться переиспользовать соединение.
+        // A close-delimited response must announce `Connection: close`, because the server closes
+        // the socket right after the body.
         headers["Connection"] = (request.keepAlive && length >= 0) ? "keep-alive" : "close"
         headers["Content-Length"] = length >= 0 ? String(length) : ""
         if let state = reply.cacheState, headers["X-MediaProxy-Cache"] == nil {
@@ -350,7 +351,7 @@ public final class HttpServer {
             try reply.body?.write(to: fd, offset: offset, count: count, deadline: deadline)
             return true
         } catch {
-            // Абортивное закрытие: SOCLINGER 0 → RST, чтобы плеер понял «тело оборвано».
+            // Abortive close: SO_LINGER 0 sends RST so the player sees the body was cut short.
             var linger = Darwin.linger(l_onoff: 1, l_linger: 0)
             Darwin.setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, socklen_t(MemoryLayout<Darwin.linger>.size))
             return false

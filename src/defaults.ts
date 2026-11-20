@@ -1,8 +1,8 @@
 import type { MediaProxyConfig } from './types';
 
 /**
- * Дефолты согласованы с планом (§6.2): таймауты короче, чем у плеера (Media3 8 с), лимит — один
- * владелец бюджета (512 МБ), prefetch — 30 с / 6 сегментов / 2 параллельно.
+ * Timeouts stay below the player's own request timeout (Media3 uses 8 s), so the proxy fails over
+ * before playback gives up.
  */
 export const DEFAULT_CONFIG: MediaProxyConfig = {
   enabled: true,

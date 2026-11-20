@@ -8,8 +8,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Тестовый origin: отдаёт media/master-плейлисты и сегменты, умеет 206, 403, HTML, обрыв, тишину.
- * Счётчики запросов нужны, чтобы проверять «отдали из кэша, в origin не ходили».
+ * Test origin: serves media and master playlists plus segments, with 206, 403, HTML, truncation, and silence.
+ * Request counters let tests assert that a cache hit never reached the origin.
  */
 class FixtureOrigin {
     private val server: HttpServer = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
@@ -23,7 +23,7 @@ class FixtureOrigin {
     val segmentBytes: ByteArray = ByteArray(segmentSize) { (it * 7 % 251).toByte() }
     val keyBytes: ByteArray = ByteArray(16) { (it + 1).toByte() }
 
-    /** Заголовки последнего запроса к /seg/1.ts — для проверки проброса сессии. */
+    /** Headers of the last request to /seg/1.ts, used to check header pass-through. */
     val recordedHeaders = ConcurrentHashMap<String, String>()
 
     val port: Int get() = server.address.port
@@ -38,11 +38,11 @@ class FixtureOrigin {
     val resumeUrl: String get() = "$baseUrl/resume.m3u8"
     val resume2Url: String get() = "$baseUrl/resume2.m3u8"
     val flakyUrl: String get() = "$baseUrl/flaky.m3u8"
-    /** Плейлист, у которого URL сегмента МЕНЯЕТСЯ при каждом перечитывании (?v=N). */
+    /** Playlist whose segment URL changes on every re-read (?v=N). */
     val rotUrl: String get() = "$baseUrl/rot.m3u8"
-    /** Плейлист, у которого URL сегмента постоянный, а сегмент висит (для бюджета вотчдога). */
+    /** Playlist with a fixed segment URL whose segment hangs; used for the stall detector budget. */
     val staticUrl: String get() = "$baseUrl/static.m3u8"
-    /** Плейлист отдаётся один раз, затем 403 — умершая подпись (проверка onAuthRequired на рефреше). */
+    /** Served once, then 403: an expired signature, used to check onAuthRequired on refresh. */
     val authRotUrl: String get() = "$baseUrl/authrot.m3u8"
 
     private val rotVersion = AtomicInteger(0)
@@ -183,8 +183,8 @@ class FixtureOrigin {
                 bump("resume2-playlist")
                 send(exchange, 200, "application/vnd.apple.mpegurl", resume2Playlist().toByteArray(), range)
             }
-            // Перечитывание манифеста меняет URL сегмента: так проверяется «перезапуск манифеста
-            // на уровне прокси» — повтор уходит на свежий URL, и клиент получает тело целиком.
+            // Re-reading the playlist changes the segment URL, so the proxy retry hits a fresh URL.
+            // This checks that the client still receives the full body.
             path == "/rot.m3u8" -> {
                 bump("rot-playlist")
                 val version = rotVersion.incrementAndGet()
@@ -196,8 +196,8 @@ class FixtureOrigin {
                 val version = exchange.requestURI.query?.removePrefix("v=")?.toIntOrNull() ?: 1
                 bump("rot-seg$version")
                 if (version == 1) {
-                    // «Залипший» edge: без Range — 200 с обещанной длиной и обрывом на 400-м байте;
-                    // с Range — честный 206 с правильным Content-Range, но пустым телом.
+                    // Stuck CDN edge: without Range it sends 200 with the promised length and stops at 400 bytes.
+                    // With Range it sends an honest 206 with a correct Content-Range but an empty body.
                     if (range == null) {
                         exchange.sendResponseHeaders(200, segmentSize.toLong())
                         exchange.responseBody.write(segmentBytes, 0, 400)
@@ -220,7 +220,7 @@ class FixtureOrigin {
                     "#EXTINF:4.000,\n$baseUrl/hang\n#EXT-X-ENDLIST\n"
                 send(exchange, 200, "application/vnd.apple.mpegurl", text.toByteArray(), range)
             }
-            // Тело, которое «капает» и замолкает: загрузка живёт дольше порога вотчдога.
+            // The body trickles and then goes silent, so the download outlives the stall detector threshold.
             path == "/hang" -> {
                 bump("hang")
                 val start = Http.rangeStart(range)
@@ -247,8 +247,8 @@ class FixtureOrigin {
                     send(exchange, 403, "text/plain", "expired".toByteArray(), null)
                 }
             }
-            // Рвётся на КАЖДОМ запросе без Range (400 из 1000 байт), а с Range — отдаёт хвост.
-            // Так проверяется докачка между запросами плеера, а не только внутри одной загрузки.
+            // Every request without Range breaks at 400 of 1000 bytes; with Range it serves the remainder.
+            // This tests resume across player requests, not only within one download.
             path == "/resume2" -> {
                 bump("resume2")
                 recordedHeaders["resume2-range"] = exchange.requestHeaders.getFirst("Range") ?: ""

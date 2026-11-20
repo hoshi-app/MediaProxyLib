@@ -1,16 +1,17 @@
 import Foundation
 
-/// Дисковый кэш сегментов: append-only журнал, сверка с файлами при старте, LRU целыми стримами,
-/// refcount для отложенного удаления. Никаких tmp→rename на каждом сегменте (класс ошибок B-01).
+/// Disk cache for segments: append-only journal, reconciliation with files on startup.
+/// Eviction is LRU over whole streams, and a refcount defers deletion until readers finish.
+/// Segments are appended in place, never written to a temp file and renamed.
 public final class CacheStore {
     public struct Entry {
         public var index: Int
-        public var total: Int64        // -1 = неизвестно
-        public var prefix: Int64       // непрерывно записанный префикс
+        public var total: Int64        // -1 = unknown
+        public var prefix: Int64       // contiguous prefix written so far
         public var complete: Bool
         public var failedUntil: TimeInterval = 0
         public var contentType: String?
-        /// ETag ответа origin: нужен для `If-Range` при докачке с префикса.
+        /// Origin ETag, used as `If-Range` when resuming from the prefix.
         public var etag: String? = nil
         public var downloading: Bool = false
         public var feed: ByteFeed? = nil
@@ -62,7 +63,7 @@ public final class CacheStore {
                 existing.lastAccess = now
                 return existing
             }
-            // Плейлист изменился — старый каталог невалиден и вытесняется первым.
+            // The media playlist changed, so the old directory is invalid and is evicted first.
             streams.removeValue(forKey: key)
             Fs.removeIfExists(existing.dir)
         }
@@ -147,7 +148,8 @@ public final class CacheStore {
 
     // MARK: - eviction
 
-    /// Освобождает место под `required` байт. Возвращает false, если места нет (тогда — pass-through).
+    /// Frees room for `required` bytes. Returns false when space cannot be made,
+    /// and the caller falls back to pass-through.
     public func evictIfNeeded(required: Int64, protecting: Set<String>, now: TimeInterval) -> Bool {
         lock.lock(); defer { lock.unlock() }
         let cfg = config()
@@ -169,7 +171,7 @@ public final class CacheStore {
         return totalBytesLocked() + required <= cfg.maxCacheBytes
     }
 
-    /// Сколько стримов вытеснено с момента старта — для `getStats().evictions`.
+    /// Number of evicted streams since start, reported as `getStats().evictions`.
     public func evictedCount() -> Int64 {
         lock.lock(); defer { lock.unlock() }
         return evictedStreams
@@ -192,8 +194,8 @@ public final class CacheStore {
         }
         for s in targets {
             freed += streamBytesLocked(s)
-            // Записи чистим всегда: иначе после clear сервер отдавал бы «complete»-сегменты,
-            // файлов которых уже нет (FileBody падает, а плеер видит обрыв).
+            // Clear entries even for open streams: stale "complete" entries would serve deleted files,
+            // and FileBody would fail in the middle of the body.
             s.entries.removeAll()
             streams.removeValue(forKey: s.key)
             Fs.removeIfExists(s.dir)
@@ -206,16 +208,18 @@ public final class CacheStore {
     private func load(_ stream: Stream) {
         let journalURL = stream.dir.appendingPathComponent("journal.log")
         let lines = Fs.readLines(journalURL)
-        // Шапка — единственный способ после рестарта процесса отличить «тот же контент» от другого
-        // плейлиста с тем же cacheKey (PROTOCOL §3). Формат H|2: отпечаток ПЕРЕД cacheKey, потому
-        // что cacheKey приложения содержит `|` (`t1|p-x|e2|q720`) и разбирать его на части нельзя.
+        // The header is the only way after a process restart to tell the same media playlist from a
+        // different one with the same cacheKey.
+        // Format `H|2`: the fingerprint comes before cacheKey, because app cache keys contain `|`
+        // (`t1|p-x|e2|q720`) and must be treated as opaque.
         let header = lines.last { $0.hasPrefix("H|") }
         let hasSegments = lines.contains { $0.hasPrefix("S|") }
         if hasSegments && !headerMatches(header, stream: stream) {
             wipe(stream)
             return
         }
-        // Append-only журнал: последняя запись по индексу побеждает, сверка с файлом — один раз на запись.
+        // Append-only journal: the last record per index wins,
+        // and each entry is reconciled with its file once.
         var latest: [Int: Entry] = [:]
         for line in lines {
             let parts = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
@@ -241,7 +245,7 @@ public final class CacheStore {
             if e.total < 0 { e.complete = false }
             if e.prefix > 0 || e.complete { stream.entries[index] = e }
         }
-        // Файлы, которых нет в журнале, — сироты.
+        // Files missing from the journal are orphans.
         let known = Set(stream.entries.keys.map { String(format: "s%05d.bin", $0) })
         if let files = try? FileManager.default.contentsOfDirectory(atPath: stream.dir.path) {
             for file in files where file.hasSuffix(".bin") && !known.contains(file) {
@@ -260,7 +264,7 @@ public final class CacheStore {
         return fingerprint == stream.fingerprint && cacheKey == stream.cacheKey
     }
 
-    /// Снос невалидного каталога: чужие/битые записи не должны пережить смену плейлиста.
+    /// Removes an invalid directory: foreign or corrupt records must not survive a media playlist change.
     private func wipe(_ stream: Stream) {
         stream.entries.removeAll()
         if let files = try? FileManager.default.contentsOfDirectory(atPath: stream.dir.path) {

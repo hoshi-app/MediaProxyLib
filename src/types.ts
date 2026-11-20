@@ -1,47 +1,47 @@
-/** Политика прокси. Всё, что меняется из JS, живёт здесь (натив ничего не решает по таймаутам «сам»). */
+/** Proxy policy. Every JS-tunable setting lives here; native code never picks timeout values itself. */
 export type ServingMode = 'stream' | 'complete';
 
 export type MediaProxyConfig = {
   enabled: boolean;
-  /** Единый бюджет диска; приложение передаёт свой videoCacheMB. */
+  /** Single disk budget shared by all sessions; the app passes its own video cache size. */
   maxCacheMB: number;
-  /** Меньше этого свободного места — не кэшируем (pass-through). */
+  /** Below this much free disk space nothing is cached (pass-through). */
   minFreeDiskMB: number;
   maxSessions: number;
   prefetchSeconds: number;
   prefetchMaxSegments: number;
   prefetchConcurrency: number;
   interactiveConcurrency: number;
-  /** Ожидание соединения/заголовков для запросов плеера. Должно быть меньше, чем у плеера (Media3 8 с). */
+  /** Connect and header wait for player requests; keep below the player's own timeout (Media3 8 s). */
   reqConnectSec: number;
   reqFirstByteSec: number;
   reqSilenceSec: number;
   prefetchFirstByteSec: number;
   prefetchSilenceSec: number;
   prefetchRetries: number;
-  /** Пол скорости — только для prefetch/продолжений (запрос плеера не рвём по скорости). */
+  /** Speed floor applies to prefetch and resumed downloads only; player requests are never aborted. */
   minSpeedKBps: number;
   cooldownSec: number;
   prewarmSegments: number;
   /**
-   * Вотчдог зависшей загрузки: через сколько секунд без прироста байт движок сам перечитывает
-   * манифест (0 — выключить).
+   * Stall detector: seconds without byte progress before the engine re-reads the media playlist
+   * itself (0 disables it).
    */
   stallKickSec: number;
-  /** Сколько таких киков допускается на один сегмент, прежде чем движок сдаётся плееру. */
+  /** Recovery attempts allowed per segment before the engine gives up and leaves it to the player. */
   recoveryMax: number;
-  /** stream = tee (по умолчанию), complete = сначала сегмент целиком (fallback после S3). */
+  /** stream = tee (default); complete = fetch the whole segment first (fallback after S3). */
   serving: ServingMode;
   debug: boolean;
 };
 
 export type ResolveOptions = {
-  /** Стабильная идентичность кэша: t<id>|p-<player>|v-<voice>|e<ep>|q<quality>. */
+  /** Stable cache identity: t<id>|p-<player>|v-<voice>|e<ep>|q<quality>. */
   cacheKey?: string;
   headers?: Record<string, string>;
-  /** false — прокси без диска (live/BYTERANGE/отладка). */
+  /** false serves without disk cache (live, BYTERANGE, debugging). */
   cache?: boolean;
-  /** Предзагрузка плейлиста и первых сегментов (по умолчанию true). */
+  /** Prefetch the media playlist and first segments (default true). */
   prewarm?: boolean;
 };
 
@@ -72,9 +72,9 @@ export type ProxyStats = {
   misses: number;
   evictions: number;
   prefetched: number;
-  /** Сколько раз движок сам перечитывал манифест из-за зависшей загрузки. */
+  /** How often the engine re-read the media playlist after a stalled download. */
   stallKicks: number;
-  /** Сколько раз origin обрывал тело сегмента (TRUNCATED) — диагностика «залипшего edge». */
+  /** How often the origin cut the segment body short (TRUNCATED); hints at a stuck edge. */
   originTruncated: number;
   maxSessions: number;
 };
@@ -96,25 +96,28 @@ export type StreamState = {
 
 export type FailOpenResult = { streamId?: string; originUrl?: string };
 
-/** Итог «перезапуска манифеста» на уровне прокси (сторож плеера зовёт его вместо перемонтажа). */
+/**
+ * Outcome of a media playlist restart at the proxy level. The player's stall detector calls it
+ * instead of remounting the player.
+ */
 export type RestartResult = {
-  /** Сколько сегментов поставлено в догрузку. */
+  /** Segments queued for download. */
   queued: number;
-  /** Плейлист реально перечитан и подменён (структура сегментов не изменилась). */
+  /** The playlist was really re-read and swapped in, with the same segment structure. */
   refreshed: boolean;
-  /** Изменился ли хоть один URL сегментов — только тогда рестарт реально что-то поменял. */
+  /** Whether any segment URL changed; only then did the restart change anything. */
   segmentsChanged: boolean;
   cacheable?: boolean;
   reason: string;
 };
 
-/** Движок сам заметил зависшую загрузку и перезапустил манифест (без перемонтажа плеера). */
+/** The engine noticed a stalled download and restarted the media playlist without a player remount. */
 export type RecoverEvent = {
   streamId: string;
   segmentIndex: number;
-  /** Сколько секунд без прироста байт уже прошло. */
+  /** Seconds already spent without byte progress. */
   waitedSec: number;
-  /** Удалось ли перейти на свежий URL сегмента. */
+  /** Whether switching to a fresh segment URL succeeded. */
   urlChanged: boolean;
 };
 
@@ -183,14 +186,14 @@ export type CacheEvent = {
   maxBytes: number;
 };
 
-/** Контракт нативного модуля (то, что реализуют Kotlin и Swift). */
+/** Contract of the native module implemented by Kotlin and Swift. */
 export type NativeMediaProxy = {
   start(): StartResult;
   resolve(origin: string, options: ResolveOptions): ResolveResult;
   release(streamId: string): void;
   failOpen(streamIdOrUrl: string): FailOpenResult | null;
   nudge(streamId: string): { queued: number };
-  /** AsyncFunction в нативе: внутри сетевой перезапрос плейлиста, поэтому Promise. */
+  /** AsyncFunction in native: it re-fetches the playlist over the network, hence the Promise. */
   restartStream(streamId: string): Promise<RestartResult>;
   setConfig(patch: Partial<MediaProxyConfig>): void;
   getStats(): ProxyStats;

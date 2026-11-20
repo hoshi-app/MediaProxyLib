@@ -1,8 +1,8 @@
 package tv.mediaproxy.core
 
 /**
- * Коды ошибок: один словарь на обе платформы (см. docs/PROTOCOL.md, план приложение B).
- * `httpStatus` — что отдаём плееру; 4xx origin наружу не отдаём никогда (Media3 убивает item).
+ * Error codes shared by both platforms; see docs/PROTOCOL.md.
+ * `httpStatus` is what the player receives. Origin 4xx is never passed through: Media3 kills the item.
  */
 enum class ProxyErrorCode(
     val wire: String,
@@ -48,8 +48,8 @@ enum class ProxyErrorCode(
             403 -> ORIGIN_403
             404 -> ORIGIN_404
             410 -> ORIGIN_410
-            // 416 на наш Range означает, что префикс не подходит к ресурсу: движок сбрасывает
-            // сегмент и начинает его заново, а не отдаёт склейку.
+            // A 416 for our Range means the prefix does not match the resource. The engine restarts
+            // the segment instead of serving a splice.
             416 -> RANGE_UNSUPPORTED
             429 -> ORIGIN_429
             in 400..499 -> ORIGIN_400

@@ -10,7 +10,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.system.exitProcess
 
-// ── мини-раннер: без JUnit (в офлайн-кеше его нет), но с exit code и списком провалов ─────────────
+// ── mini runner: no JUnit (not in the offline cache), exit code and failure list ─────────────────
 
 private var checks = 0
 private var failures = 0
@@ -145,7 +145,7 @@ private fun testRewriter() {
     check("candidate по .m3u8", PlaylistRewriter.isPlaylistCandidate("https://x/a.m3u8?sig=1", null))
     check("не candidate без расширения", !PlaylistRewriter.isPlaylistCandidate("https://x/video/", null))
 
-    // kodik: относительные сегменты, query в базе
+    // Relative segment URLs; the base URL carries the query.
     val kodikBase = "https://p14.solodcdn.com/s/m/hash/2a29:2026/720.mp4:hls:manifest.m3u8?sig=2&ms=1"
     val kodik = """
         #EXTM3U
@@ -175,7 +175,7 @@ private fun testRewriter() {
         uriLines(kodikResult.text)[0],
     )
 
-    // CVH: вариант без расширения, абсолютные сегменты
+    // Variant URL without an extension, with one relative and one absolute segment.
     val cvhBase = "https://vd1.okcdn.ru/video/index.m3u8?cmd=x"
     val cvh = """
         #EXTM3U
@@ -191,7 +191,7 @@ private fun testRewriter() {
     eq("cvh относительный", "https://vd1.okcdn.ru/video/HIGH00000.ts?cmd=x", cvhResult.media.segments[0].url)
     eq("cvh абсолютный", "https://vd1.okcdn.ru/video/HIGH00001.ts?cmd=x", cvhResult.media.segments[1].url)
 
-    // master + качества
+    // Master playlist with two variants.
     val masterBase = "https://vd1.okcdn.ru/video/master.m3u8?tok=t"
     val master = """
         #EXTM3U
@@ -212,7 +212,7 @@ private fun testRewriter() {
     truth("master не кэшируется", !masterResult.cacheable)
     check("master lines proxied", uriLines(masterResult.text).all { it.startsWith("P|PLAYLIST|") })
 
-    // fMP4 + AES-128: MAP и KEY переписываются, ключ не кэшируется
+    // fMP4 with AES-128: MAP and KEY URIs are rewritten; the key bytes are not cached.
     val fmp4 = """
         #EXTM3U
         #EXT-X-TARGETDURATION:4
@@ -231,13 +231,13 @@ private fun testRewriter() {
     check("map line proxied", fmp4Result.text.contains("URI=\"P|SEGMENT|https://h.example/v/init.mp4\""))
     check("key line proxied", fmp4Result.text.contains("URI=\"P|KEY|https://h.example/v/key.bin\""))
 
-    // KEY METHOD=NONE — не трогаем
+    // METHOD=NONE is left untouched.
     val noneKey = "#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\ns.ts\n#EXT-X-ENDLIST\n"
     val noneResult = rewrite(noneKey, "https://h.example/v/index.m3u8")
     eq("METHOD=NONE keyUrls", 0, noneResult.media.keyUrls.size)
     truth("METHOD=NONE строка не тронута", noneResult.text.contains("#EXT-X-KEY:METHOD=NONE"))
 
-    // SAMPLE-AES → drm, ключ с skd:// не проксируем
+    // SAMPLE-AES means DRM; skd:// key URIs are not proxied.
     val drm = "#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://key\"\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\ns.ts\n#EXT-X-ENDLIST\n"
     val drmResult = rewrite(drm, "https://h.example/v/index.m3u8")
     truth("SAMPLE-AES drm", drmResult.media.drm)
@@ -267,12 +267,12 @@ private fun testRewriter() {
     val mediaResult = rewrite(media, "https://h.example/master.m3u8")
     check("EXT-X-MEDIA переписан", mediaResult.text.contains("URI=\"P|PLAYLIST|https://h.example/audio/en.m3u8\""))
 
-    // CRLF сохраняется
+    // CRLF line endings are preserved.
     val crlf = "#EXTM3U\r\n#EXT-X-TARGETDURATION:4\r\n#EXTINF:4,\r\ns.ts\r\n#EXT-X-ENDLIST\r\n"
     val crlfResult = rewrite(crlf, "https://h.example/v/index.m3u8")
     truth("CRLF сохранён", crlfResult.text.contains("\r\n"))
 
-    // отпечаток не зависит от подписи (query) — перерезолв переиспользует кэш
+    // The fingerprint ignores the query signature, so re-resolving reuses the cache.
     val a = rewrite(kodik, kodikBase)
     val b = rewrite(kodik, "https://p14.solodcdn.com/s/m/hash/2a29:2026/720.mp4:hls:manifest.m3u8?sig=999&ms=1")
     eq("fingerprint без подписи", a.fingerprint, b.fingerprint)
@@ -332,7 +332,7 @@ private fun testCache() {
             it.contentType = "video/mp2t"
         }
 
-        // «рестарт»: новый экземпляр читает журнал и сверяет файлы
+        // Restart: a new instance reads the journal and reconciles the files.
         val store2 = CacheStore(dir) { cfg }
         val stream2 = store2.openStream("key|ep1", "fp1", 2)
         val entry = store2.entry(stream2, 0)
@@ -341,14 +341,14 @@ private fun testCache() {
         eq("contentType после рестарта", "video/mp2t", entry?.contentType)
         eq("complete после рестарта", false, entry?.complete)
 
-        // файл длиннее журнала → усекаем до коммита
+        // A file longer than the journal is truncated to the committed prefix.
         file.writeBytes(ByteArray(80) { it.toByte() })
         val store3 = CacheStore(dir) { cfg }
         val stream3 = store3.openStream("key|ep1", "fp1", 3)
         eq("усечение до prefix", 50L, store3.entry(stream3, 0)?.prefix)
         eq("файл усечён", 50L, store3.fileURL(stream3, 0).length())
 
-        // complete
+        // The completion flag survives a restart.
         store3.update(stream3, 0) {
             it.prefix = 50
             it.total = 50
@@ -358,13 +358,13 @@ private fun testCache() {
         val stream4 = store4.openStream("key|ep1", "fp1", 4)
         eq("complete после рестарта", true, store4.entry(stream4, 0)?.complete)
 
-        // смена отпечатка → старый каталог невалиден
+        // A changed fingerprint invalidates the old directory.
         val stream5 = store4.openStream("key|ep1", "fp2", 5)
         truth("новый отпечаток", stream5.fingerprint == "fp2")
         eq("старые записи не унаследованы", null, store4.entry(stream5, 0))
 
-        // «рестарт процесса»: шапка журнала обязана отклонять сегменты чужого плейлиста,
-        // иначе после перезапуска приложения отдавались бы готовые байты другого контента.
+        // After a process restart, the journal header must reject segments from another playlist.
+        // Otherwise a restarted app would serve bytes from different content.
         val restartDir = tempDir()
         try {
             val before = CacheStore(restartDir) { cfg }
@@ -384,7 +384,7 @@ private fun testCache() {
             cleanup(restartDir)
         }
 
-        // эвикция целыми стримами
+        // Eviction removes whole streams.
         val big = CacheStore(dir) { ProxyConfig(maxCacheBytes = 1200, minFreeDiskBytes = 0) }
         val s1 = big.openStream("a", "fp", 1)
         val s2 = big.openStream("b", "fp", 2)
@@ -398,7 +398,7 @@ private fun testCache() {
         truth("место под 500 есть", big.evictIfNeeded(500, emptySet(), 3))
         truth("что-то вытеснено", big.totalBytes() <= 900)
 
-        // защищённый стрим не трогаем
+        // Clearing a stream frees its bytes and removes the directory.
         val protectedDir = s1.dir
         val freed = big.clear("a")
         truth("clear вернул байты", freed >= 0)
@@ -408,7 +408,7 @@ private fun testCache() {
     }
 }
 
-// ── HTTP-сервер (конформанс) ────────────────────────────────────────────────────────────────────
+// ── HTTP server (conformance) ────────────────────────────────────────────────────────────────────
 
 private fun testHttpServer() {
     group("HttpServer")
@@ -458,7 +458,7 @@ private fun testHttpServer() {
         eq("416", 416, invalid.status)
         eq("416 content-range", "bytes */100", invalid.headers["content-range"])
 
-        // keep-alive: два ответа в одном сокете
+        // keep-alive: two responses on one socket.
         Socket("127.0.0.1", port).use { socket ->
             socket.soTimeout = 5000
             val request = "GET /bytes HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n"
@@ -473,7 +473,7 @@ private fun testHttpServer() {
             eq("keep-alive body", 100, second.body.size)
         }
 
-        // потоковая запись в растущий файл
+        // Streaming into a growing file.
         val growThread = Thread {
             for (i in 0 until 5) {
                 growingFeed.append(payload, i * 20, 20)
@@ -487,7 +487,7 @@ private fun testHttpServer() {
         eq("grow length", "100", grown.headers["content-length"])
         truth("grow body", grown.body.contentEquals(payload))
 
-        // неизвестная длина — close-delimited
+        // Unknown length: the body is delimited by connection close.
         Thread {
             unknownFeed.append("hello ".toByteArray())
             unknownFeed.append("world".toByteArray())
@@ -498,7 +498,7 @@ private fun testHttpServer() {
         eq("unknown нет content-length", null, unknown.headers["content-length"])
         eq("unknown body", "hello world", String(unknown.body))
 
-        // параллельные соединения
+        // Concurrent connections.
         val latch = CountDownLatch(8)
         val okCount = AtomicInteger(0)
         repeat(8) {
@@ -595,7 +595,7 @@ private fun testOriginClient() {
         truth("байты совпали", File(dir, "ok.bin").readBytes().contentEquals(origin.segmentBytes))
         eq("origin hits", 1, origin.hits("seg-0"))
 
-        // resume: уже есть 100 байт, Range продолжает
+        // Resume: 100 bytes are already present, so the request continues with Range.
         val resumeFile = File(dir, "resume.bin")
         val resumeFeed = ByteFeed(resumeFile)
         resumeFeed.append(origin.segmentBytes, 0, 100)
@@ -607,7 +607,7 @@ private fun testOriginClient() {
         eq("resume written", origin.segmentSize.toLong(), resumeFeed.written)
         truth("resume байты", resumeFile.readBytes().contentEquals(origin.segmentBytes))
 
-        // 200 в ответ на Range — сигнал движку
+        // A 200 response to a Range request surfaces as RANGE_UNSUPPORTED.
         val ignore = client.download(
             OriginClient.Request("${origin.baseUrl}/ignore-range", emptyMap(), 100, profile, false),
             ByteFeed(File(dir, "ignore.bin")),
@@ -728,7 +728,7 @@ private fun testEngine() {
         truth("range на кэше байты", ranged.body.contentEquals(origin.segmentBytes.copyOfRange(10, 20)))
         eq("range content-range", "bytes 10-19/1000", ranged.headers["content-range"])
 
-        // перерезолв с новым токеном и тем же cacheKey: сегмент должен взяться из кэша
+        // Re-resolve with a new token and the same cache key: the segment must come from cache.
         origin.token = "t2"
         val second = engine.resolve(origin.mediaUrl, ProxyEngine.ResolveOptions("k|ep1", headers, cache = true, prewarm = false))
         val playlist2 = httpGet(second.url)
@@ -741,19 +741,19 @@ private fun testEngine() {
         truth("сегмент после перерезолва байты", seg3.body.contentEquals(origin.segmentBytes))
         eq("origin seg-0 после перерезолва", 1, origin.hits("seg-0"))
 
-        // master: варианты переписаны
+        // Master playlist: variant URLs are rewritten.
         val masterResolved = engine.resolve(origin.masterUrl, ProxyEngine.ResolveOptions("k|master", headers))
         val masterPlaylist = httpGet(masterResolved.url)
         eq("master status", 200, masterPlaylist.status)
         truth("master переписан", String(masterPlaylist.body).contains("127.0.0.1:${engine.port}/s/"))
         truth("master варианты .m3u8", uriLines(String(masterPlaylist.body)).all { it.endsWith(".m3u8") })
 
-        // fail-open: старые URL после release не обслуживаются
+        // After fail-open the stale URLs are no longer served.
         engine.failOpen(second.streamId)
         val stale = httpGet(segUrl2)
         eq("после failOpen 410", 410, stale.status)
 
-        // 403 плейлиста → onAuthRequired
+        // A 403 on the playlist raises onAuthRequired.
         val forbidden = engine.resolve(origin.forbiddenUrl, ProxyEngine.ResolveOptions("k|auth", headers))
         val forbiddenReply = httpGet(forbidden.url)
         eq("403 -> 502", 502, forbiddenReply.status)
@@ -761,9 +761,9 @@ private fun testEngine() {
         val authEvent = synchronized(events) { events.firstOrNull { it.first == "onAuthRequired" } }
         eq("onAuthRequired originStatus", 403, authEvent?.second?.get("originStatus"))
 
-        // 5xx сегмента → один onError; кулдаун — ограничение ТОЛЬКО для prefetch.
-        // Запрос плеера кулдаун не глушит: иначе плеер получает 502 на живом сегменте и стрим
-        // перемонтируется (баг «зависло и перемонтировалось», лог 12.11).
+        // A segment 5xx raises one onError.
+        // The cooldown limits prefetch only: a player request is never suppressed.
+        // Otherwise the player gets 502 on a live segment and remounts the stream.
         val badPlaylist = engine.resolve("${origin.baseUrl}/bad.m3u8", ProxyEngine.ResolveOptions("k|bad", headers))
         val badReply1 = httpGet(badPlaylist.url)
         eq("bad playlist 200", 200, badReply1.status)
@@ -776,7 +776,7 @@ private fun testEngine() {
         eq("запрос плеера сходил в origin", 2, origin.hits("bad"))
         waitUntil(2000) { synchronized(events) { events.any { it.first == "onError" && it.second["code"] == "ORIGIN_5XX" } } }
 
-        // таймаут сегмента → 504
+        // A segment timeout returns 504.
         val slowPlaylist = engine.resolve("${origin.baseUrl}/slowplaylist.m3u8", ProxyEngine.ResolveOptions("k|slow", headers))
         val slowReply = httpGet(slowPlaylist.url)
         eq("slow playlist 200", 200, slowReply.status)
@@ -784,7 +784,7 @@ private fun testEngine() {
         val slow = httpGet(slowSeg)
         eq("таймаут сегмента 504", 504, slow.status)
 
-        // clearCache
+        // clearCache frees all cached bytes.
         val cleared = engine.clearCache()
         truth("clearCache вернул байты", (cleared["freedBytes"] as Long) >= 0)
 
@@ -962,7 +962,7 @@ private fun testEngineLifecycle() {
         eq("restart segment", 200, restartResult.status)
         truth("restart байты", restartResult.body.contentEquals(origin.segmentBytes))
 
-        // мусорный запрос не валит сервер
+        // A garbage request must not take the server down.
         Socket("127.0.0.1", engine.port).use { socket ->
             socket.soTimeout = 2000
             socket.getOutputStream().write("GARBAGE\r\n\r\n".toByteArray())
@@ -1044,8 +1044,8 @@ private fun testEnginePrefetchState() {
         )
         truth("prefetch учтён один раз", waitUntil(3000) { (engine.stats()["prefetched"] as Long) == 3L })
         truth("nudge не падает", (engine.nudge(resolved.streamId)["queued"] as? Int ?: 0) >= 0)
-        // «Перезапуск манифеста» на уровне прокси (вместо перемонтажа плеера): плейлист перечитан,
-        // структура сегментов та же — значит кэш остаётся валидным и ничего не сносится.
+        // restart() re-reads the media playlist at the proxy instead of remounting the player.
+        // The segment layout is unchanged, so the cache stays valid and nothing is dropped.
         val restarted = engine.restart(resolved.streamId)
         eq("restart перечитал манифест", true, restarted["refreshed"])
         truth("restart сохранил кэш", (engine.streamState(resolved.streamId)["cachedAheadSec"] as Double) > 0)
@@ -1063,7 +1063,7 @@ private fun testEnginePrefetchState() {
     }
 }
 
-// ── P0-регрессии: докачка, pass-through Range, преварм live, clearCache, ретраи, TTL ─────────────
+// ── Regression tests: resume, pass-through Range, live prewarm, clearCache, retries, TTL ─────────
 
 private fun uriPath(url: String): String =
     runCatching { java.net.URI(url).path }.getOrDefault("/")
@@ -1073,16 +1073,17 @@ private fun testP0Fixes() {
     val origin = FixtureOrigin().start()
     val dir = tempDir()
     val headers = mapOf("User-Agent" to "ProxyTest/1.0")
-    // cooldown=0 и без ретраев: ошибка фиксируется сразу, а следующий запрос должен её продолжить.
+    // cooldown=0 and no retries: the error is recorded at once, and the next request resumes.
     val engine = newEngine(dir, mapOf("cooldownSec" to 0, "prefetchRetries" to 0, "prewarmSegments" to 0))
     try {
-        // 1. Докачка между запросами: первый обрывается на 400 из 1000 байт, второй — Range: bytes=400-.
+        // 1. Resume across requests: the first response stops at 400 of 1000 bytes.
+        // The next request sends Range: bytes=400-.
         val resume = engine.resolve(origin.resume2Url, ProxyEngine.ResolveOptions("resume2|1", headers, prewarm = false))
         val resumePlaylist = httpGet(resume.url)
         eq("resume2 playlist", 200, resumePlaylist.status)
         val resumeSegment = firstSegment(String(resumePlaylist.body))
         eq("первый запрос без Range", "", origin.recordedHeaders["resume2-range"] ?: "")
-        // Обрыв посреди тела: плеер видит абортивное закрытие, а не «короткое успешное тело».
+        // The body is cut mid-stream, so the player sees an aborted close, not a short successful body.
         runCatching { httpGet(resumeSegment) }
         eq("origin получил один запрос", 1, origin.hits("resume2"))
         val resumed = runCatching { httpGet(resumeSegment) }.getOrThrow()
@@ -1094,7 +1095,7 @@ private fun testP0Fixes() {
         truth("тело собрано целиком", resumed.body.contentEquals(origin.segmentBytes))
         eq("origin не перекачивал с нуля", 2, origin.hits("resume2"))
 
-        // 2. Pass-through: Content-Range считается от полного размера ресурса.
+        // 2. Pass-through: Content-Range is computed from the full resource size.
         val passthrough = newEngine(tempDir(), mapOf("maxCacheMB" to 0))
         try {
             val resolved = passthrough.resolve(origin.mediaUrl, ProxyEngine.ResolveOptions("pass|1", headers, prewarm = false))
@@ -1111,7 +1112,7 @@ private fun testP0Fixes() {
             passthrough.stop()
         }
 
-        // 3. Ретраит плеер, а не мы: 503 на первом запросе не повторяется нативно.
+        // 3. The player retries, not the proxy: a 503 on the first request is not retried internally.
         val flaky = engine.resolve(origin.flakyUrl, ProxyEngine.ResolveOptions("flaky|1", headers, prewarm = false))
         val flakyPlaylist = httpGet(flaky.url)
         eq("flaky playlist", 200, flakyPlaylist.status)
@@ -1123,7 +1124,7 @@ private fun testP0Fixes() {
         eq("второй запрос 200", 200, flakySecond.status)
         eq("плеер переспросил сам", 2, origin.hits("flaky"))
 
-        // 4. clearCache с неизвестным streamId не должен стирать весь кэш.
+        // 4. clearCache with an unknown streamId must not wipe the whole cache.
         val keep = engine.resolve(origin.mediaUrl, ProxyEngine.ResolveOptions("keep|1", headers, prewarm = false))
         val keepPlaylist = httpGet(keep.url)
         val keepSegment = firstSegment(String(keepPlaylist.body))
@@ -1134,7 +1135,7 @@ private fun testP0Fixes() {
         eq("clearCache неизвестного id", 0L, engine.clearCache("nonexistent").get("freedBytes") as Long)
         eq("кэш не тронут", bytesBefore, engine.stats()["bytes"] as Long)
 
-        // 5. setConfig не должен бросать при повышении конкурентности.
+        // 5. setConfig must not throw when concurrency is raised.
         truth(
             "resize пулов",
             runCatching {
@@ -1149,20 +1150,20 @@ private fun testP0Fixes() {
     }
 }
 
-// ── восстановление: перезапуск манифеста на уровне прокси (вместо перемонтажа плеера) ────────────
+// ── Recovery: the proxy re-reads the media playlist instead of remounting the player ─────────────
 
 private fun testRecovery() {
     group("ProxyEngine: восстановление после обрыва")
     val origin = FixtureOrigin().start()
     val dir = tempDir()
-    // stallKickSec=1 — чтобы вотчдог успел сработать в пределах теста; prefetchRetries=5 —
-    // чтобы залипшая загрузка жила дольше двух тиков.
+    // stallKickSec=1 so the stall detector fires within the test.
+    // prefetchRetries=5 keeps a stuck download alive for more than two ticks.
     val engine = newEngine(dir, mapOf("stallKickSec" to 1.0, "prefetchRetries" to 5))
     val events = mutableListOf<Pair<String, Map<String, Any?>>>()
     engine.onEvent = { name, payload -> synchronized(events) { events.add(name to payload) } }
     try {
-        // 1. Сегмент отвалился на «залипшем» edge: прокси сам перечитывает манифест, уходит на
-        //    свежий URL и дотягивает ТОТ ЖЕ клиентский ответ — плееру переспрашивать не нужно.
+        // 1. The segment fails on a stuck CDN edge: the proxy re-reads the media playlist itself.
+        //    It retries the fresh URL and completes the same client response, so the player needs no extra request.
         val rot = engine.resolve(origin.rotUrl, ProxyEngine.ResolveOptions("rot|1", emptyMap(), prewarm = false))
         val rotPlaylist = httpGet(rot.url)
         eq("rot playlist", 200, rotPlaylist.status)
@@ -1175,15 +1176,16 @@ private fun testRecovery() {
         eq("манифест перечитан один раз", 2, origin.hits("rot-playlist"))
         truth("был запрос на свежий URL", origin.hits("rot-seg2") >= 1)
 
-        // 2. Старый URL после перечитывания по-прежнему адресует тот же сегмент, иначе плеер
-        //    получал бы pass-through мимо кэша (вторая нога правки — карта поколений URL).
+        // 2. After the re-read the old URL still addresses the same segment.
+        //    Otherwise the player would get a pass-through that bypasses the cache.
         val beforeHits = origin.hits("rot-seg2")
         val again = httpGet(oldSegment)
         eq("старый URL отдаётся", 200, again.status)
         eq("старый URL целиком", origin.segmentSize, again.body.size)
         eq("старый URL из кэша", beforeHits, origin.hits("rot-seg2"))
 
-        // 3. Вотчдог: загрузка залипла, URL не меняется — прокси сам кикает, но не больше recoveryMax.
+        // 3. The stall detector fires: the download is stuck and the URL does not change.
+        //    The proxy restarts it at most recoveryMax times.
         val stat = engine.resolve(origin.staticUrl, ProxyEngine.ResolveOptions("static|1", emptyMap(), prewarm = false))
         val stPlaylist = httpGet(stat.url)
         eq("static playlist", 200, stPlaylist.status)
@@ -1199,7 +1201,7 @@ private fun testRecovery() {
         eq("onRecover столько же", kicks.toInt(), synchronized(events) { events.count { it.first == "onRecover" } })
         client.interrupt()
 
-        // 4. Умерла подпись манифеста: рефреш обязан сообщить в JS, а не молча сдаться.
+        // 4. The playlist signature expired: a refresh must report to JS instead of failing silently.
         val auth = engine.resolve(origin.authRotUrl, ProxyEngine.ResolveOptions("authrot|1", emptyMap(), prewarm = false))
         httpGet(auth.url)
         engine.restart(auth.streamId)
@@ -1207,7 +1209,7 @@ private fun testRecovery() {
             synchronized(events) { events.any { it.first == "onAuthRequired" && it.second["originStatus"] == 403 } }
         })
 
-        // 5. Неизвестная сессия — явный отказ, а не тихий no-op (JS по нему сразу перемонтирует).
+        // 5. An unknown session returns an explicit error, not a silent no-op; JS remounts on it.
         val unknown = engine.restart("nope")
         truth("restart неизвестной сессии", unknown["reason"] == ProxyErrorCode.SESSION_UNKNOWN.wire)
     } finally {
@@ -1228,8 +1230,8 @@ private fun testLivePrewarmAndTtl() {
         val playlist = httpGet(resolved.url)
         eq("live playlist", 200, playlist.status)
         Thread.sleep(400)
-        // Live не кэшируется, поэтому прогрев первых сегментов — пустая трата трафика (и целого
-        // медиафайла у BYTERANGE).
+        // Live playlists are not cached, so prewarming their first segments only wastes traffic.
+        // For BYTERANGE it would fetch the whole media file.
         eq("прогрева для live нет", 0, origin.hits("seg-0"))
 
         eq("в пределах TTL origin не дёргаем", 1, origin.hits("live"))
@@ -1254,7 +1256,7 @@ private fun waitUntil(timeoutMs: Long, condition: () -> Boolean): Boolean {
     return condition()
 }
 
-// ── HTTP-клиент для тестов ──────────────────────────────────────────────────────────────────────
+// ── Test HTTP client ─────────────────────────────────────────────────────────────────────────────
 
 private data class HttpResult(val status: Int, val body: ByteArray, val headers: Map<String, String>)
 

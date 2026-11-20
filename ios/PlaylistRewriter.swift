@@ -38,7 +38,7 @@ public struct RewriteResult {
     public let reason: String
 }
 
-/// Переписывает HLS-плейлист на loopback-URL. Чистая функция: никакого I/O, всё тестируется на фикстурах.
+/// Rewrites an HLS playlist to loopback URLs. Pure function with no I/O, so fixtures cover it entirely.
 public enum PlaylistRewriter {
     public typealias ProxyBuilder = (_ absoluteOriginUrl: String, _ kind: ResourceKind) -> String
 
@@ -115,12 +115,12 @@ public enum PlaylistRewriter {
                     }
                 }
 
-                // URI-несущие теги: переписываем сам атрибут (резолв от финального URL обязателен).
+                // Tags that carry a URI are rewritten in place; resolving against the final URL is required.
                 if let kind = uriTagKind(upper) {
                     let lineOut = rewriteUriAttribute(line) { raw in
                         let absolute = UrlResolver.resolve(base: finalUrl, reference: raw)
                         if !absolute.hasPrefix("http://") && !absolute.hasPrefix("https://") {
-                            return nil  // skd:// и прочие не-HTTP схемы обрабатывает плеер
+                            return nil  // the player handles skd:// and other non-HTTP schemes
                         }
                         switch kind {
                         case .playlist:
@@ -140,7 +140,7 @@ public enum PlaylistRewriter {
                 continue
             }
 
-            // Строка-URI: либо вариант master'а, либо сегмент media-плейлиста.
+            // A bare URI line is a master variant in a master playlist and a segment otherwise.
             let absolute = UrlResolver.resolve(base: finalUrl, reference: line)
             if isMaster {
                 let proxyUrl = proxy(absolute, .playlist)
@@ -235,8 +235,8 @@ public enum PlaylistRewriter {
     }
 }
 
-/// Резолв относительных URI. Отличие от RFC 3986 сознательное: ссылка без query наследует query базы —
-/// иначе kodik/CVH теряют `sig` (совпадает с `src/lib/urlResolve.ts` в AnimeApp).
+/// Resolves relative URIs. A reference without a query inherits the base query, unlike RFC 3986.
+/// kodik and CVH lose `sig` otherwise.
 public enum UrlResolver {
     public static func resolve(base: String, reference: String) -> String {
         let ref = reference.trimmingCharacters(in: .whitespaces)
@@ -246,7 +246,7 @@ public enum UrlResolver {
         guard let resolved = URL(string: ref, relativeTo: baseURL)?.absoluteString else { return ref }
 
         let refHasQuery = ref.contains("?")
-        // Схемо-относительная ссылка — самостоятельный URL: query базы не наследуем.
+        // A scheme-relative reference is a full URL, so it does not inherit the base query.
         if ref.hasPrefix("//") { return resolved }
         let baseQuery = baseURL.query
         if !refHasQuery, let q = baseQuery, !q.isEmpty, !resolved.contains("?") {

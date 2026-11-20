@@ -11,8 +11,9 @@ import java.util.concurrent.Semaphore
 import kotlin.concurrent.thread
 
 /**
- * Минимальный HTTP/1.1 на loopback: GET/HEAD, keep-alive, всегда Content-Length (или close-delimited),
- * Range/206/416, поток на соединение, лимит соединений. Chunked не нужен: длину знаем.
+ * Minimal loopback HTTP/1.1: GET/HEAD, keep-alive, always Content-Length (or close-delimited),
+ * Range/206/416, one thread per connection, and a connection limit. Chunked is not needed because
+ * the length is known.
  */
 class HttpServer(
     private val host: String = "127.0.0.1",
@@ -102,8 +103,8 @@ class HttpServer(
         val method = parts[0].uppercase()
         if (method != "GET" && method != "HEAD") return null
         var path = parts[1].substringBefore('?')
-        // absolute-form (RFC 7230 §5.3.2): некоторые клиенты шлют полный URL вместо пути.
-        // Без нормализации такой запрос уходил бы в 404, хотя ресурс есть.
+        // Some clients send an absolute-form request URI (RFC 7230 §5.3.2) instead of a path.
+        // Without normalization such a request would 404 even though the resource exists.
         if (path.startsWith("http://", ignoreCase = true) || path.startsWith("https://", ignoreCase = true)) {
             path = runCatching { java.net.URI(path).path ?: path }.getOrDefault(path)
         }
@@ -174,7 +175,7 @@ class HttpServer(
             output.flush()
             true
         } catch (e: IOException) {
-            // Абортивное закрытие: SO_LINGER 0 → RST, чтобы плеер понял «тело оборвано».
+            // Abortive close: SO_LINGER 0 sends RST so the player sees the body was cut off.
             runCatching {
                 socket.setSoLinger(true, 0)
                 socket.close()

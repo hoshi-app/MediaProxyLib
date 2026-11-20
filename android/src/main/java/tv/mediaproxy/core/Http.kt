@@ -27,8 +27,8 @@ object Http {
     )
 
     /**
-     * Разбор одного `Range`. Несколько диапазонов/неизвестный формат -> None (отдаём 200),
-     * заведомо неверный диапазон -> Unsatisfiable (416).
+     * Parses a single `Range`. Multiple ranges or an unknown format return None (serve 200);
+     * a clearly invalid range returns Unsatisfiable (416).
      */
     fun parseRange(header: String?, total: Long): RangeResult {
         if (header == null || total <= 0) return RangeResult.None
@@ -55,7 +55,7 @@ object Http {
         return RangeResult.Valid(start, end)
     }
 
-    /** Начало диапазона для pass-through; 0 — если диапазона нет/он не распознан. */
+    /** Range start for pass-through, or 0 when there is no range or it is not recognized. */
     fun rangeStart(header: String?): Long {
         if (header == null) return 0
         val spec = header.trim().removePrefix("bytes=")
@@ -146,7 +146,7 @@ class FileBody(private val file: File) : HttpResponseBody {
     }
 }
 
-/** Отдача сегмента, который ещё качается: читает файл по мере роста, ждёт на feed. */
+/** Serves a segment that is still downloading: reads the file as it grows and waits on the feed. */
 class GrowingFileBody(private val file: File, private val feed: ByteFeed) : HttpResponseBody {
     override fun write(out: OutputStream, offset: Long, count: Long, deadlineMs: Long) {
         RandomAccessFile(file, "r").use { raf ->
@@ -182,8 +182,9 @@ class GrowingFileBody(private val file: File, private val feed: ByteFeed) : Http
 }
 
 /**
- * Pass-through: отдаём по мере прихода из памяти (без диска). Тело не должно оказаться короче
- * обещанного `Content-Length`: при провале рвём соединение, иначе плеер будет ждать хвост.
+ * Pass-through: serves bytes as they arrive in memory, without disk. The body must not be shorter
+ * than the promised `Content-Length`; on failure the connection is dropped so the player does not
+ * wait for the tail.
  */
 class StreamBody(private val feed: ByteFeed) : HttpResponseBody {
     override fun write(out: OutputStream, offset: Long, count: Long, deadlineMs: Long) {

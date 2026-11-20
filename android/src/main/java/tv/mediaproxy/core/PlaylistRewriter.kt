@@ -42,8 +42,8 @@ data class RewriteResult(
 )
 
 /**
- * Переписывает HLS-плейлист на loopback-URL. Чистая функция: никакого I/O — проверяется фикстурами.
- * Покрывает URI-несущие теги, относительные и абсолютные ссылки, наследование query базы (kodik/CVH).
+ * Rewrites HLS playlists to loopback URLs. Pure, with no I/O, so fixtures can verify it.
+ * Handles URI-bearing tags, relative and absolute links, and base query inheritance (kodik/CVH).
  */
 object PlaylistRewriter {
     private val uriAttr = Regex("URI=\"([^\"]*)\"")
@@ -127,7 +127,7 @@ object PlaylistRewriter {
                     out.append(
                         rewriteUriAttribute(line) { raw ->
                             val absolute = UrlResolver.resolve(finalUrl, raw)
-                            // skd://, data: и прочие не-HTTP схемы не проксируем — их обрабатывает плеер.
+                            // Non-HTTP schemes such as skd:// and data: are not proxied; the player handles them.
                             if (!absolute.startsWith("http://") && !absolute.startsWith("https://")) {
                                 null
                             } else {
@@ -151,7 +151,7 @@ object PlaylistRewriter {
                 return@forEachIndexed
             }
 
-            // Строка-URI: вариант master'а или сегмент media-плейлиста.
+            // A URI line: a master playlist variant or a media playlist segment.
             val absolute = UrlResolver.resolve(finalUrl, line)
             if (isMaster) {
                 variants.add(
@@ -229,8 +229,8 @@ object PlaylistRewriter {
 }
 
 /**
- * Резолв относительных URI. Отличие от RFC 3986 сознательное: ссылка без query наследует query базы —
- * иначе kodik/CVH теряют `sig` (совпадает с `src/lib/urlResolve.ts` в AnimeApp).
+ * Resolves relative URIs. The deviation from RFC 3986 is deliberate: a reference without a query
+ * inherits the base query, or kodik/CVH lose `sig`.
  */
 object UrlResolver {
     fun resolve(base: String, reference: String): String {
@@ -239,7 +239,7 @@ object UrlResolver {
         val baseUri = runCatching { URI(base) }.getOrNull() ?: return ref
         if (runCatching { URI(ref).isAbsolute }.getOrDefault(false)) return ref
         val resolved = runCatching { baseUri.resolve(ref).toString() }.getOrNull() ?: return ref
-        // Схемо-относительная ссылка — самостоятельный URL: query базы не наследуем.
+        // A scheme-relative reference is a standalone URL, so it does not inherit the base query.
         if (ref.startsWith("//")) return resolved
         val refHasQuery = ref.contains('?')
         val baseQuery = baseUri.rawQuery

@@ -22,7 +22,8 @@ android {
 }
 
 dependencies {
-    // RN API не используем (только expo-modules-core): без версии react-android разрешается
-    // лишь substitution'ом RN-плагина и падает при сборке модуля вне root-проекта.
+    // Only expo-modules-core is used, not the RN API.
+    // An unversioned react-android resolves only through the RN plugin substitution and fails
+    // when the module builds outside the root project.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

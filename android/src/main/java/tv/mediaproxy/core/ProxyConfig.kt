@@ -1,6 +1,6 @@
 package tv.mediaproxy.core
 
-/** Конфигурация движка. Значения — из плана (§6.2, §7.2): таймауты короче, чем у плеера (Media3 8 с). */
+/** Engine configuration. Timeouts are shorter than the player's, which uses 8 s in Media3. */
 data class ProxyConfig(
     val enabled: Boolean = true,
     val maxCacheBytes: Long = 512L * 1024 * 1024,
@@ -21,11 +21,11 @@ data class ProxyConfig(
     val cooldownSec: Double = 30.0,
     val prewarmSegments: Int = 2,
     /**
-     * Вотчдог зависшей загрузки: сколько секунд без прироста байт ждать до «перезапуска манифеста».
-     * 0 — выключить вотчдог.
+     * Stall detector: seconds without byte progress before the media playlist is restarted.
+     * 0 disables the detector.
      */
     val stallKickSec: Double = 6.0,
-    /** Сколько киков допускается на один сегмент, прежде чем движок сдаётся (дальше решает плеер). */
+    /** Retries allowed per segment before the engine gives up and leaves the decision to the player. */
     val recoveryMax: Int = 2,
     val maxLoopbackConnections: Int = 32,
     val socketIdleSec: Double = 60.0,
@@ -33,7 +33,7 @@ data class ProxyConfig(
     val maxBufferThenServeBytes: Int = 8 * 1024 * 1024,
     val serving: ServingMode = ServingMode.STREAM,
     val debug: Boolean = false,
-    /** Только для тестов/локальных origin: разрешить loopback-адреса как источник. */
+    /** Tests and local origins only: allow loopback addresses as an origin. */
     val allowLoopbackOrigins: Boolean = false,
 ) {
     fun withPatch(patch: Map<String, Any?>): ProxyConfig {
@@ -80,7 +80,7 @@ enum class ServingMode(val wire: String) {
     COMPLETE("complete"),
 }
 
-/** Таймауты одного origin-запроса. minSpeedBps = 0 — пол скорости не применяется. */
+/** Timeouts for one origin request. `minSpeedBps = 0` disables the minimum-speed check. */
 data class TimeoutProfile(
     val connectMs: Long,
     val firstByteMs: Long,
@@ -114,8 +114,9 @@ data class TimeoutProfile(
         )
 
         /**
-         * Перечитывание манифеста ради ретрая сегмента: коротко и жёстко. Обычный профиль плейлиста
-         * (20 с) держал бы слот интерактивной загрузки до минуты — а он нужен как раз во время голода.
+         * Re-reads the media playlist to retry a segment, so it stays short and strict. The normal
+         * playlist profile (20 s) would hold an interactive download slot for up to a minute, exactly
+         * when a slot is scarce.
          */
         fun refresh(c: ProxyConfig) = TimeoutProfile(
             connectMs = (c.reqConnectSec * 1000).toLong(),

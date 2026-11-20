@@ -1,5 +1,6 @@
-# Сборка и прогон ядра MediaProxy без Gradle и сети: кэшированный Kotlin-компилятор + JDK.
-# Тесты — assert-раннер tv.mediaproxy.core.SelfTest (exit code 1 при провале).
+# Builds and runs the MediaProxy core without Gradle or network access, using a cached Kotlin
+# compiler and the JDK. The tests are the tv.mediaproxy.core.SelfTest assert runner (exit code 1 on
+# failure).
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $cache = Join-Path $env:USERPROFILE '.gradle\caches\modules-2\files-2.1'

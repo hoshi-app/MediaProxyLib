@@ -1,7 +1,8 @@
 import Foundation
 
-/// Конфигурация движка. Значения по умолчанию — из плана (§6.2, §7.2): таймауты короче, чем у плеера
-/// (Media3 живёт 8 с connect/read), иначе плеер отваливается первым и наши ретраи невидимы.
+/// Engine configuration. Default timeouts are shorter than the player's,
+/// since Media3 uses 8 s for connect/read.
+/// Otherwise the player gives up first and our retries stay invisible.
 public struct ProxyConfig {
     public var enabled: Bool = true
     public var maxCacheBytes: Int64 = 512 * 1024 * 1024
@@ -21,10 +22,10 @@ public struct ProxyConfig {
     public var retryBackoffMs: [Int64] = [500, 1500, 4000]
     public var cooldownSec: Double = 30
     public var prewarmSegments: Int = 2
-    /// Вотчдог зависшей загрузки: сколько секунд без прироста байт ждать до «перезапуска манифеста».
-    /// 0 — выключить вотчдог.
+    /// Stall detector: seconds without byte growth before the engine restarts the media playlist.
+    /// `0` disables the detector.
     public var stallKickSec: Double = 6
-    /// Сколько киков допускается на один сегмент, прежде чем движок сдаётся (дальше решает плеер).
+    /// Recovery attempts allowed per segment before the engine gives up and leaves it to the player.
     public var recoveryMax: Int = 2
     public var maxLoopbackConnections: Int = 32
     public var socketIdleSec: Double = 60
@@ -35,7 +36,7 @@ public struct ProxyConfig {
 
     public init() {}
 
-    /// Применяет частичный словарь из JS (ключи — как в TS `Config`). Неизвестные ключи игнорируются.
+    /// Applies a partial dictionary from JS, keyed like the TS `Config`. Unknown keys are ignored.
     public mutating func apply(_ patch: [String: Any]) {
         func b(_ k: String) -> Bool? { patch[k] as? Bool }
         func i(_ k: String) -> Int? {
@@ -74,16 +75,16 @@ public struct ProxyConfig {
 }
 
 public enum ServingMode: String {
-    case stream   // tee: отдаём плееру по мере прихода байтов (по умолчанию)
-    case complete // сначала сегмент целиком, потом ответ (безопасный fallback, S3)
+    case stream   // tee: serve the player as bytes arrive (default)
+    case complete // buffer the whole segment before replying (safe fallback for S3)
 }
 
-/// Таймауты одного origin-запроса. `nil` = не применять.
+/// Timeouts for a single origin request.
 public struct TimeoutProfile {
     public var connectMs: Int64
     public var firstByteMs: Int64
     public var silenceMs: Int64
-    public var minSpeedBps: Int64      // 0 = выключен (для запросов плеера не применяется)
+    public var minSpeedBps: Int64      // 0 disables the check; player requests do not use it
     public var speedWindowMs: Int64
 
     public static func interactive(_ c: ProxyConfig) -> TimeoutProfile {
@@ -110,8 +111,9 @@ public struct TimeoutProfile {
                        speedWindowMs: 0)
     }
 
-    /// Перечитывание манифеста ради ретрая сегмента: коротко и жёстко. Профиль плейлиста (20 с)
-    /// держал бы слот интерактивной загрузки до минуты — а он нужен как раз во время голода.
+    /// Media playlist refresh used for a segment retry: short and strict.
+    /// The playlist profile (20 s) would hold an interactive slot for up to a minute,
+    /// exactly when the player is starved.
     public static func refresh(_ c: ProxyConfig) -> TimeoutProfile {
         TimeoutProfile(connectMs: Int64(c.reqConnectSec * 1000),
                        firstByteMs: 8000,
@@ -141,7 +143,7 @@ public enum Log {
 }
 
 public enum Ids {
-    /// Стабильный 64-битный хеш (FNV-1a) для имён каталогов: одинаковый в Swift и Kotlin.
+    /// Stable 64-bit FNV-1a hash for directory names, identical in Swift and Kotlin.
     public static func fnv1a(_ text: String) -> UInt64 {
         var hash: UInt64 = 0xcbf29ce484222325
         for byte in text.utf8 {
@@ -155,7 +157,7 @@ public enum Ids {
         String(format: "%016llx", fnv1a(cacheKey))
     }
 
-    /// 128-битный идентификатор сессии: hex, 32 символа.
+    /// 128-bit session identifier as 32 hex characters.
     public static func sessionId() -> String {
         var bytes = [UInt8](repeating: 0, count: 16)
         for i in 0..<16 { bytes[i] = UInt8.random(in: 0...255) }
@@ -163,7 +165,7 @@ public enum Ids {
     }
 }
 
-/// `b64url` без паддинга — компактный и однозначный способ положить origin-URL в путь.
+/// Unpadded `base64url`, a compact and unambiguous way to put an origin URL in a path.
 public enum B64Url {
     public static func encode(_ text: String) -> String {
         Data(text.utf8).base64EncodedString()

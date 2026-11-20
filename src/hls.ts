@@ -1,16 +1,14 @@
 /**
- * Подсказка контейнера нативному плееру (`source.type` у react-native-video).
+ * Container hint for the native player (`source.type` in react-native-video).
  *
- * ExoPlayer (Android) определяет тип по расширению последнего сегмента URL (`Util.inferContentType`)
- * и без подсказки строит ProgressiveMediaSource — для варианта CVH без расширения
- * (`…/id/…/video/`) это `UnrecognizedInputFormatException`. AVPlayer (iOS) смотрит на тело ответа,
- * подсказка ему не нужна и не мешает.
+ * ExoPlayer infers the type from the extension of the last URL segment and otherwise builds a
+ * ProgressiveMediaSource, which throws `UnrecognizedInputFormatException` for an extensionless CVH
+ * variant (`…/id/…/video/`). AVPlayer sniffs the response body, so the hint neither helps nor
+ * hurts it.
  *
- * Loopback-URL из `resolve()` всегда оканчивается на `.m3u8` (см. docs/PROTOCOL.md §1), подсказка
- * нужна для исходного URL: `cached: false`, `failOpen()` и прямая игра мимо прокси.
- *
- * Правило: нет расширения или `.m3u8` → HLS. Расширение ищем только в последнем сегменте пути:
- * точки в каталогах и в query расширением не являются.
+ * Loopback URLs from `resolve()` always end in `.m3u8`, so the hint matters for the origin URL used
+ * with `cached: false`, `failOpen()` and direct playback. No extension or `.m3u8` means HLS. Only
+ * the last path segment counts: dots in directories and query strings are not extensions.
  */
 export function isHlsUrl(url: string): boolean {
   const path = String(url ?? '').replace(/[?#].*$/, '');

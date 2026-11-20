@@ -22,8 +22,9 @@ const MODULE_NAME = 'MediaProxy';
 let nativeCache: NativeMediaProxy | null | undefined;
 
 /**
- * Натив ищем лениво: библиотека должна импортироваться в тестах/на web/в Expo Go без краша.
- * Если модуля нет — resolve() возвращает origin и cached:false, и плеер играет как раньше.
+ * Loaded lazily so the library still imports in tests, on web and in Expo Go without crashing.
+ * Without the native module, `resolve()` returns the origin with `cached: false` and playback works
+ * as before.
  */
 function loadNative(): NativeMediaProxy | null {
   if (nativeCache !== undefined) return nativeCache;
@@ -48,7 +49,7 @@ export function getDefaultConfig(): MediaProxyConfig {
   return { ...DEFAULT_CONFIG };
 }
 
-// ── нормализация ответов натива (он возвращает обычные объекты, а не гарантии) ────────────────────
+// ── native response normalization (plain objects, no guarantees) ─────────────────────────────────
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
@@ -136,11 +137,12 @@ function fallbackResolve(origin: string, reason: string): ResolveResult {
   return { streamId: '', url: origin, cached: false, reason, generation: 0 };
 }
 
-// ── публичное API ───────────────────────────────────────────────────────────────────────────────
+// ── public API ───────────────────────────────────────────────────────────────────────────────────
 
 /**
- * Поднимает loopback-сервер один раз на процесс. Вызывать при загрузке приложения; `resolve` можно
- * звать сразу после (он синхронный). Если сервер не поднялся — вернёт issues, а resolve отдаст origin.
+ * Starts the loopback server once per process; call it when the app loads. `resolve` is synchronous
+ * and can be called right after. If the server fails to start, the result carries `issues` and
+ * `resolve` keeps returning the origin.
  */
 export async function start(): Promise<StartResult> {
   const native = loadNative();
@@ -153,8 +155,8 @@ export async function start(): Promise<StartResult> {
 }
 
 /**
- * Создаёт сессию и отдаёт loopback-URL для плеера. Синхронный и не бросает: на любой сбой — origin
- * с `cached:false` (fail-open по контракту приложения).
+ * Creates a session and returns the loopback URL for the player. Synchronous and never throws: any
+ * failure yields the origin with `cached: false`, per the app's fail-open contract.
  */
 export function resolve(origin: string, options: ResolveOptions = {}): ResolveResult {
   const native = loadNative();
@@ -170,18 +172,18 @@ export function resolve(origin: string, options: ResolveOptions = {}): ResolveRe
   }
 }
 
-/** Освобождает сессию: отменяет prefetch, снимает refcount, кэш остаётся до вытеснения. */
+/** Releases the session: cancels prefetch and drops the refcount; cached bytes stay until eviction. */
 export function release(streamId: string): void {
   const native = loadNative();
   if (!native || !streamId) return;
   try {
     native.release(streamId);
   } catch {
-    // fail-open: сессия истечёт сама
+    // fail-open: the session expires on its own
   }
 }
 
-/** Аварийный перевод потока на origin (после ошибки плеера по loopback-URL). */
+/** Switches the stream to the origin after the player failed on the loopback URL. */
 export function failOpen(streamIdOrUrl: string): FailOpenResult | null {
   const native = loadNative();
   if (!native || !streamIdOrUrl) return null;
@@ -196,7 +198,7 @@ export function failOpen(streamIdOrUrl: string): FailOpenResult | null {
   }
 }
 
-/** «Догрузи вперёд» для сторожа: окно prefetch от последнего запрошенного сегмента. */
+/** Queues a prefetch window ahead of the last requested segment; the app's stall detector calls it. */
 export function nudge(streamId: string): { queued: number } {
   const native = loadNative();
   if (!native || !streamId) return { queued: 0 };
@@ -208,9 +210,9 @@ export function nudge(streamId: string): { queued: number } {
 }
 
 /**
- * Перезапуск манифеста НА УРОВНЕ ПРОКСИ: перечитывает media-плейлист (свежие URL сегментов у CDN)
- * и заново ставит загрузку залипшего окна. Плееру перемонтироваться не нужно — этого и добиваемся.
- * Асинхронный: в нативе это AsyncFunction (внутри сетевой запрос плейлиста).
+ * Restarts the media playlist at the proxy level: re-reads it for fresh segment URLs from the CDN
+ * and re-queues the stuck window, so the player needs no remount. Asynchronous because the native
+ * side is an AsyncFunction that issues a network request.
  */
 export async function restart(streamId: string): Promise<RestartResult> {
   const native = loadNative();
@@ -230,14 +232,14 @@ export async function restart(streamId: string): Promise<RestartResult> {
   }
 }
 
-/** Меняет политику на лету; применяется к следующим запросам. */
+/** Changes policy at runtime; it applies to subsequent requests. */
 export function setConfig(patch: Partial<MediaProxyConfig>): void {
   const native = loadNative();
   if (!native) return;
   try {
     native.setConfig(patch);
   } catch {
-    // политика не применилась — работаем на дефолтах натива
+    // policy not applied — keep running on the native defaults
   }
 }
 
@@ -251,7 +253,7 @@ export function getStats(): ProxyStats {
   }
 }
 
-/** Состояние сегментов для полосы «на диске» в UI. */
+/** Segment state for the "on disk" bar in the UI. */
 export function getStreamState(streamId: string): StreamState {
   const native = loadNative();
   if (!native || !streamId) return normalizeStreamState(null);
@@ -272,7 +274,7 @@ export function clearCache(streamId?: string): { freedBytes: number } {
   }
 }
 
-// ── события ─────────────────────────────────────────────────────────────────────────────────────
+// ── events ──────────────────────────────────────────────────────────────────────────────────────
 
 function subscribe<T>(event: string, listener: (payload: T) => void): Subscription {
   const native = loadNative();
@@ -281,7 +283,7 @@ function subscribe<T>(event: string, listener: (payload: T) => void): Subscripti
     const subscription = native.addListener(event, (payload) => listener(payload as T));
     if (subscription && typeof subscription.remove === 'function') return subscription;
   } catch {
-    // подписка не удалась — событий не будет, это не повод падать
+    // subscription failed — no events will arrive, which is no reason to crash
   }
   return { remove: () => {} };
 }
@@ -298,11 +300,11 @@ export const onServerState = (listener: (event: ServerStateEvent) => void): Subs
 export const onCache = (listener: (event: CacheEvent) => void): Subscription =>
   subscribe<CacheEvent>('onCache', listener);
 
-/** Движок сам перечитывает манифест при зависшей загрузке — плееру перемонтироваться не нужно. */
+/** The engine re-reads the media playlist on a stalled download, so the player needs no remount. */
 export const onRecover = (listener: (event: RecoverEvent) => void): Subscription =>
   subscribe<RecoverEvent>('onRecover', listener);
 
-/** HLS ли это по URL: нужно для подсказки `source.type` плееру (см. src/hls.ts). */
+/** Whether the URL is HLS; needed for the player's `source.type` hint (see src/hls.ts). */
 export { isHlsUrl } from './hls';
 
 export type {

@@ -16,8 +16,8 @@ import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLException
 
 /**
- * Сетевой слой origin: OkHttp с потоковой отдачей, три таймаута (первый байт / тишина / пол скорости)
- * и валидацией ответа. Ретраи — не здесь: их считает движок (единый бюджет на сегмент, §6.3).
+ * Origin network layer: OkHttp with streaming, three timeouts (first byte, silence, minimum speed),
+ * and response validation. Retries live in the engine, which owns the per-segment budget.
  */
 class OriginClient(private val config: () -> ProxyConfig) {
     data class Request(
@@ -26,7 +26,7 @@ class OriginClient(private val config: () -> ProxyConfig) {
         val rangeStart: Long,
         val profile: TimeoutProfile,
         val isPrefetch: Boolean,
-        /** ETag для `If-Range`: докачка с префикса не должна склеивать две версии ресурса. */
+        /** ETag for `If-Range`, so a prefix resume does not splice two versions of the resource. */
         val ifRange: String? = null,
     )
 
@@ -60,14 +60,17 @@ class OriginClient(private val config: () -> ProxyConfig) {
         runCatching { baseClient.dispatcher.executorService.shutdown() }
     }
 
-    /** Скачивает ресурс в feed. Возвращает код ошибки или null (успех). Терминальные состояния feed ставит движок. */
+    /**
+     * Downloads a resource into the feed. Returns an error code or null on success.
+     * The engine sets the feed's terminal state.
+     */
     fun download(request: Request, feed: ByteFeed): DownloadResult {
         val builder = OkRequest.Builder().url(request.url)
         applyHeaders(builder, request.headers)
         if (request.rangeStart > 0) {
             builder.header("Range", "bytes=${request.rangeStart}-")
-            // Если ресурс сменился, origin обязан ответить 200 с целым телом, и мы не склеим
-            // префикс старой версии с хвостом новой (тогда сработает RANGE_UNSUPPORTED).
+            // If the resource changed, the origin must answer 200 with the full body, so the old
+            // prefix is not spliced to the new tail. That case surfaces as RANGE_UNSUPPORTED.
             request.ifRange?.let { builder.header("If-Range", it) }
         }
 
@@ -128,13 +131,14 @@ class OriginClient(private val config: () -> ProxyConfig) {
                         return DownloadResult(ProxyErrorCode.RANGE_UNSUPPORTED, null, cookies)
                     }
                     total = parsed.third
-                    // Ресурс короче нашего префикса — докачивать нечего,Range невалиден.
+                    // The resource is shorter than our prefix, so the range is invalid and nothing can resume.
                     if (total in 0 until request.rangeStart) {
                         return DownloadResult(ProxyErrorCode.RANGE_UNSUPPORTED, null, cookies)
                     }
                 }
                 val finalUrl = response.request.url.toString()
-                // База до чтения тела: у докачки `written` уже содержит префикс, у pass-through — 0.
+                // Baseline before reading the body: on resume `written` already includes the prefix,
+                // on pass-through it is 0.
                 val baseline = feed.written
                 feed.setMeta(total, contentType, finalUrl, response.header("ETag"))
                 val body = response.body ?: return DownloadResult(ProxyErrorCode.EMPTY_RESPONSE, finalUrl, cookies)
@@ -148,9 +152,9 @@ class OriginClient(private val config: () -> ProxyConfig) {
                     speedCounter.addAndGet(n.toLong())
                     feed.append(buffer, 0, n)
                 }
-                // Ожидаем `baseline + длина тела`. Для 206 `total` — размер ВСЕГО ресурса, поэтому
-                // при Range отличном от нуля ожидание = total - rangeStart, иначе любой 206 с
-                // докачкой/pass-through ложно считался бы TRUNCATED.
+                // Expect `baseline + body length`. For 206, `total` is the whole resource size, so
+                // with a non-zero range start the expectation is `total - rangeStart`. Otherwise any
+                // 206 on resume or pass-through would falsely count as TRUNCATED.
                 val expected = if (total >= 0) baseline + (total - request.rangeStart) else -1L
                 if (expected >= 0 && feed.written != expected) {
                     return DownloadResult(ProxyErrorCode.TRUNCATED, finalUrl, cookies)
@@ -163,7 +167,7 @@ class OriginClient(private val config: () -> ProxyConfig) {
         } catch (e: IOException) {
             val known = terminal.get()
             if (known != null) return DownloadResult(known, null, emptyList())
-            // Обрыв после первых байт — не «нет связи», а недокачанный ответ: ретраим с префикса.
+            // A drop after the first bytes is a truncated response, not a connection failure; retry from the prefix.
             if (feed.written > 0 && !call.isCanceled()) {
                 return DownloadResult(ProxyErrorCode.TRUNCATED, null, emptyList())
             }
@@ -175,9 +179,9 @@ class OriginClient(private val config: () -> ProxyConfig) {
     }
 
     /**
-     * Плейлист/ключ: тело небольшое, читаем целиком с лимитом.
-     * `callTimeoutMs > 0` — общий потолок запроса (нужен перечитыванию манифеста: оно не должно
-     * держать слот интерактивной загрузки дольше нескольких секунд).
+     * Fetches a playlist or key. The body is small, so it is read whole with a limit.
+     * A positive `callTimeoutMs` caps the whole request; re-reading a media playlist must not hold
+     * an interactive download slot for more than a few seconds.
      */
     fun fetchPlaylist(
         url: String,

@@ -1,7 +1,8 @@
 ﻿import Foundation
 
-/// Общий буфер между загрузчиком и отдачей. Пишет либо в файл (кэш), либо в память (pass-through).
-/// Читатель ждёт `written >= N` на condition, а не EOF файла: иначе получит обрезанное тело (P-11).
+/// Shared buffer between the origin loader and the HTTP response writer.
+/// Data goes to a file for cache or to memory for pass-through.
+/// Readers wait for `written >= N` rather than EOF, because the file is still growing.
 public final class ByteFeed {
     public let file: URL?
     private let condition = NSCondition()
@@ -17,7 +18,7 @@ public final class ByteFeed {
     private var firstBytes = Data()
     private var metaReady = false
 
-    /// - Parameter resumeFrom: сколько байт уже лежит на диске (докачка с префикса). `0` — с нуля.
+    /// `resumeFrom` is how many bytes already exist on disk for prefix resume; `0` starts from scratch.
     public init(file: URL?, resumeFrom: Int64 = 0) {
         self.file = file
         if let file {
@@ -76,7 +77,7 @@ public final class ByteFeed {
         return finished
     }
 
-    /// Первые байты — для детекта `#EXTM3U`/HTML/`0x47`.
+    /// First bytes of the body, used to detect `#EXTM3U`, HTML, or a `0x47` TS sync byte.
     public var prefix: Data {
         condition.lock(); defer { condition.unlock() }
         return firstBytes
@@ -121,8 +122,8 @@ public final class ByteFeed {
         condition.unlock()
     }
 
-    /// Ждёт метаданные ответа. Учитывает докачку: `written` может быть > 0 сразу (префикс на диске),
-    /// и ждать «первый байт» в этом случае бессмысленно — нужен именно `total`.
+    /// Waits for the response metadata. On resume, `written` is already positive, so wait for `total`
+    /// rather than for the first byte.
     public func waitForMeta(timeout: TimeInterval) -> ProxyErrorCode? {
         let limit = Date().addingTimeInterval(max(0, timeout))
         condition.lock()
@@ -135,7 +136,8 @@ public final class ByteFeed {
         return nil
     }
 
-    /// Ждёт первый байт/ошибку. `nil` = дождались, иначе код ошибки (включая таймаут).
+    /// Waits for the first byte or a failure. Returns `nil` on success,
+    /// otherwise the error code, including timeout.
     public func waitForFirstBytes(timeout: TimeInterval) -> ProxyErrorCode? {
         let limit = Date().addingTimeInterval(max(0, timeout))
         condition.lock()
@@ -148,7 +150,7 @@ public final class ByteFeed {
         return nil
     }
 
-    /// Ждёт, пока появится байт с офсетом `offset` (или терминальное состояние). Возвращает доступный префикс.
+    /// Waits until byte `offset` arrives or the feed reaches a terminal state. Returns the available prefix.
     public func waitFor(offset: Int64, timeout: TimeInterval) -> Int64 {
         let limit = Date().addingTimeInterval(max(0.001, timeout))
         condition.lock()
@@ -169,7 +171,7 @@ public final class ByteFeed {
         return failure == nil
     }
 
-    /// Pass-through: следующая порция из памяти. `nil` = поток завершён (без ошибки).
+    /// Pass-through: returns the next chunk from memory. `nil` means the stream ended without an error.
     public func readChunk(maxBytes: Int, timeout: TimeInterval) -> Data? {
         let limit = Date().addingTimeInterval(max(0.001, timeout))
         condition.lock()

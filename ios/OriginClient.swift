@@ -1,7 +1,7 @@
 import Foundation
 
-/// Сетевой слой origin: URLSession с потоковыми чанками, таймаутами «первый байт / тишина / пол скорости»
-/// и валидацией ответа. Ретраи — не здесь: их считает движок (бюджет на сегмент, §6.3).
+/// Origin network layer: URLSession with streamed chunks and first-byte, silence, and minimum-speed timeouts.
+/// Retries are not handled here; the engine owns the per-segment retry budget.
 public final class OriginClient: NSObject, URLSessionDataDelegate {
     public struct Request {
         public let url: String
@@ -95,7 +95,8 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         if request.rangeStart > 0 {
             req.setValue("bytes=\(request.rangeStart)-", forHTTPHeaderField: "Range")
-            // Если ресурс сменился, origin обязан ответить 200 с целым телом — префикс не склеим.
+            // If the resource changed, the origin must answer 200 with the whole body.
+            // The old prefix cannot be spliced.
             if let ifRange = request.ifRange { req.setValue(ifRange, forHTTPHeaderField: "If-Range") }
         }
 
@@ -115,17 +116,16 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         finish(call, error: .connectFailed)
     }
 
-    // MARK: - playlist (bounded, синхронно)
+    // MARK: - playlist (bounded, synchronous)
 
-    /// `waitSec` — общий потолок ожидания (нужен перечитыванию манифеста: оно не должно держать
-    /// слот интерактивной загрузки дольше нескольких секунд). nil — расчёт по профилю.
+    /// `waitSec` is the overall wait cap for media playlist refreshes, which must not hold an interactive slot
+    /// for more than a few seconds. `nil` derives the limit from the timeout profile.
     public func fetchPlaylist(url: String, headers: [String: String], profile: TimeoutProfile,
                               maxBytes: Int, waitSec: Double? = nil) -> (data: Data?, finalUrl: String?, contentType: String?, error: ProxyErrorCode?, cookies: [String]) {
         guard let parsed = URL(string: url) else { return (nil, nil, nil, .invalidUrl, []) }
         var req = URLRequest(url: parsed)
         req.httpMethod = "GET"
         req.cachePolicy = .reloadIgnoringLocalCacheData
-        // firstByteMs — Int64, а timeoutInterval — TimeInterval (Double): без приведения не компилируется.
         req.timeoutInterval = max(1, Double(profile.firstByteMs) / 1000)
         for (key, value) in headers {
             let lowered = key.lowercased()
@@ -152,7 +152,7 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
                 result = (nil, http.url?.absoluteString, contentType,
                           OriginClient.code(for: http.statusCode), cookies); return
             }
-            // HTML-страница ошибки вместо плейлиста обязана стать событием, а не 200 (§6.4).
+            // An HTML error page instead of a playlist must surface as an error, not as a 200.
             if let contentType, contentType.lowercased().contains("text/html") {
                 result = (nil, http.url?.absoluteString, contentType, .htmlResponse, cookies); return
             }
@@ -161,7 +161,7 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
             result = (data, http.url?.absoluteString, contentType, nil, cookies)
         }
         task.resume()
-        // Таймаут + небольшой запас; при истечении задачу гасим, чтобы не держать соединение.
+        // Timeout plus a small margin; cancel the task on expiry so the connection is not held open.
         let limit = waitSec ?? Double(max(1, profile.firstByteMs / 1000 + 60))
         if semaphore.wait(timeout: .now() + max(1, limit)) == .timedOut {
             task.cancel()
@@ -199,7 +199,8 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
             completionHandler(.cancel)
             return
         }
-        // 200 в ответ на Range: origin проигнорировал диапазон — пусть движок решит (сброс/повтор с 0).
+        // A 200 answer to a Range request means the origin ignored the range. Let the engine decide
+        // whether to reset or retry from zero.
         if http.statusCode == 200, let rangeHeader = call.task?.originalRequest?.value(forHTTPHeaderField: "Range"),
            rangeHeader.hasPrefix("bytes="), !rangeHeader.hasPrefix("bytes=0-") {
             finish(call, error: .rangeUnsupported)
@@ -209,8 +210,8 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
 
         var total = http.expectedContentLength
         if http.statusCode == 206 {
-            // 206 без валидного Content-Range не принимаем: иначе `total` подменится длиной тела,
-            // и склейка префикса с чужим хвостом будет помечена как complete.
+            // Reject a 206 without a valid Content-Range: `total` would fall back to the body length,
+            // and a spliced prefix would be marked complete.
             guard let cr = http.value(forHTTPHeaderField: "Content-Range"),
                   let parsed = OriginClient.parseContentRange(cr),
                   parsed.start == call.rangeStart,
@@ -253,14 +254,15 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         let written = call.feed.written
         if let error {
             var code = OriginClient.map(error)
-            // Обрыв после первых байт — недокачанный ответ: движок ретраит с префикса.
+            // A connection loss after the first bytes is a truncated response,
+            // so the engine retries from the prefix.
             if written > 0 && code == .connectFailed { code = .truncated }
             finish(call, error: code)
             return
         }
         let total = call.feed.total
-        // Ожидаем `baseline + длина тела`: у 206 `total` — размер всего ресурса, поэтому при
-        // Range ≠ 0 ожидание = total - rangeStart (иначе любой 206 ложно был бы TRUNCATED).
+        // For a 206, `total` is the size of the whole resource, so expect `baseline + total - rangeStart`.
+        // Otherwise any ranged response would be falsely reported as truncated.
         let expected = total >= 0 ? call.baseline + (total - call.rangeStart) : -1
         if expected >= 0 && written != expected {
             finish(call, error: .truncated)
@@ -340,7 +342,7 @@ public final class OriginClient: NSObject, URLSessionDataDelegate {
         }
     }
 
-    /// `Content-Range: bytes 100-999/1000` (total может быть `*` → -1).
+    /// Parses `Content-Range: bytes 100-999/1000`; a `*` total becomes -1.
     static func parseContentRange(_ header: String) -> (start: Int64, end: Int64, total: Int64)? {
         let parts = header.split(separator: " ")
         guard parts.count >= 2, parts[0].lowercased() == "bytes" else { return nil }

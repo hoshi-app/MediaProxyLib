@@ -1,7 +1,8 @@
 import ExpoModulesCore
 import Foundation
 
-/// Expo-модуль: тонкая оболочка над `ProxyEngine`. Вся работа — в движке; здесь только контракт с JS.
+/// Expo module, a thin shell over `ProxyEngine`. All work lives in the engine;
+/// this file only defines the JS contract.
 public final class MediaProxyModule: Module {
     private var engine: ProxyEngine?
     private var root: URL = {
@@ -21,8 +22,8 @@ public final class MediaProxyModule: Module {
                 return ["port": 0, "baseUrl": "", "generation": engine.currentGeneration,
                         "issues": ["SERVER_START_FAILED"]]
             }
-            // Preflight синхронный (с коротким таймаутом): ATS-блокировка loopback должна быть
-            // видна в `issues` сразу, а не асинхронным событием после старта (§8.1).
+            // Preflight is synchronous with a short timeout: an ATS loopback block must appear in
+            // `issues` immediately, not as an async event after start.
             let issues = self.preflight(engine: engine)
             return ["port": result.port, "baseUrl": engine.baseUrl,
                     "generation": engine.currentGeneration, "issues": issues]
@@ -56,8 +57,8 @@ public final class MediaProxyModule: Module {
             self.engine?.nudge(streamId) ?? ["queued": 0]
         }
 
-        // «Перезапуск манифеста» на уровне прокси: сторож плеера просит это вместо перемонтажа.
-        // AsyncFunction: внутри сетевой запрос плейлиста (до таймаута) — JS-поток блокировать нельзя.
+        // Media playlist restart at the proxy level: the player's stall detector calls this instead of remounting.
+        // AsyncFunction because it fetches the media playlist with a timeout, and the JS thread must not block.
         AsyncFunction("restartStream") { (streamId: String) -> [String: Any] in
             self.engine?.restart(streamId) ?? ["queued": 0, "refreshed": false, "reason": "NO_ENGINE"]
         }
@@ -90,8 +91,8 @@ public final class MediaProxyModule: Module {
         return engine
     }
 
-    /// HEAD на собственный сервер: ловит -1022 (ATS) до того, как это сделает плеер.
-    /// Синхронно, с коротким таймаутом: результат уходит в `start().issues`.
+    /// HEAD to our own server to catch -1022 (ATS) before the player does.
+    /// Synchronous with a short timeout: the result goes into `start().issues`.
     private func preflight(engine: ProxyEngine) -> [String] {
         guard let url = URL(string: engine.baseUrl + "/") else { return [] }
         var request = URLRequest(url: url)
