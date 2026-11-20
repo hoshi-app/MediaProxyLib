@@ -27,3 +27,4 @@ out/
 *.log
 !docs/*.log
 /.npm-cache-tmp
+/.tmp-gradle
